@@ -7,3 +7,4 @@ Models/**/*.safetensors
 Models/**/*.bin
 Models/**/*.mlx
 .venv/
+ProbeResults/

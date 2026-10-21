@@ -7,7 +7,8 @@ let package = Package(
     name: "LocalType",
     platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "ModelSpike", targets: ["ModelSpike"])
+        .executable(name: "ModelSpike", targets: ["ModelSpike"]),
+        .executable(name: "AXProbe", targets: ["AXProbe"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift-lm", exact: "3.32.3"),
@@ -23,6 +24,15 @@ let package = Package(
                 .product(name: "Tokenizers", package: "swift-transformers"),
             ],
             path: "Sources/ModelSpike"
-        )
+        ),
+        // Этап 0, шаг 0.3: проба AX (чтение, диапазоны UTF-16, caretRect, вставка, Undo).
+        .executableTarget(
+            name: "AXProbe",
+            path: "Sources/AXProbe",
+            linkerSettings: [
+                .linkedFramework("ApplicationServices"),
+                .linkedFramework("AppKit"),
+            ]
+        ),
     ]
 )
