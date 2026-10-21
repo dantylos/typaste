@@ -9,6 +9,7 @@ let package = Package(
     products: [
         .executable(name: "ModelSpike", targets: ["ModelSpike"]),
         .executable(name: "AXProbe", targets: ["AXProbe"]),
+        .executable(name: "LocalType", targets: ["LocalType"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift-lm", exact: "3.32.3"),
@@ -29,6 +30,20 @@ let package = Package(
         .executableTarget(
             name: "AXProbe",
             path: "Sources/AXProbe",
+            linkerSettings: [
+                .linkedFramework("ApplicationServices"),
+                .linkedFramework("AppKit"),
+            ]
+        ),
+        // Фаза 1: вертикальный срез LocalType (Menu Bar + AX NativeAdapter + Qwen3 Metal + Floating Overlay + EventTap).
+        .executableTarget(
+            name: "LocalType",
+            dependencies: [
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Sources/LocalType",
             linkerSettings: [
                 .linkedFramework("ApplicationServices"),
                 .linkedFramework("AppKit"),
