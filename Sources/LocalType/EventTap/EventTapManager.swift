@@ -10,6 +10,7 @@ public final class EventTapManager {
     private var runLoopSource: CFRunLoopSource?
 
     public var onTab: (() -> Bool)?
+    public var onShiftTab: (() -> Bool)?
     public var onEscape: (() -> Bool)?
     public var onTyping: ((CGKeyCode) -> Void)?
 
@@ -75,12 +76,20 @@ public final class EventTapManager {
         }
 
         let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
+        let flags = event.flags
 
         // Tab (keyCode 48)
         if keyCode == 48 {
-            if let onTab = self.onTab, onTab() {
-                // Событие поглощено: подсказка вставлена
-                return nil
+            if flags.contains(.maskShift) {
+                // Shift+Tab: принять всю подсказку целиком
+                if let onShiftTab = self.onShiftTab, onShiftTab() {
+                    return nil
+                }
+            } else {
+                // Tab: принять по одному слову
+                if let onTab = self.onTab, onTab() {
+                    return nil
+                }
             }
         }
 
@@ -92,8 +101,10 @@ public final class EventTapManager {
             }
         }
 
-        // Любая другая клавиша
-        self.onTyping?(keyCode)
+        // Игнорируем сочетания с Command или Control (Cmd+V, Cmd+C, Cmd+Z и т.д.), чтобы они не сбрасывали состояние
+        if !flags.contains(.maskCommand) && !flags.contains(.maskControl) {
+            self.onTyping?(keyCode)
+        }
 
         return Unmanaged.passRetained(event)
     }

@@ -54,8 +54,8 @@ public final class OverlayController {
         label.lineBreakMode = .byTruncatingTail
         label.translatesAutoresizingMaskIntoConstraints = false
 
-        // Бейдж клавиш "⇥ Tab"
-        let badge = NSTextField(labelWithString: "⇥ Tab")
+        // Бейдж клавиш "⇥ Слово  ⇧⇥ Всё"
+        let badge = NSTextField(labelWithString: "⇥ Слово  ⇧⇥ Всё")
         badge.isEditable = false
         badge.isSelectable = false
         badge.isBezeled = false
@@ -80,7 +80,7 @@ public final class OverlayController {
 
             badge.trailingAnchor.constraint(equalTo: effect.trailingAnchor, constant: -10),
             badge.centerYAnchor.constraint(equalTo: effect.centerYAnchor),
-            badge.widthAnchor.constraint(greaterThanOrEqualToConstant: 44),
+            badge.widthAnchor.constraint(greaterThanOrEqualToConstant: 110),
             badge.heightAnchor.constraint(equalToConstant: 20)
         ])
 
@@ -90,16 +90,19 @@ public final class OverlayController {
         self.visualEffectView = effect
     }
 
+    private var lastCaretCocoa: CGRect?
+
     public func show(suggestion: String, at caretCocoa: CGRect) {
         guard let panel, let label = suggestionLabel else { return }
 
+        self.lastCaretCocoa = caretCocoa
         self.currentSuggestion = suggestion
         label.stringValue = suggestion
 
         // Расчет размера плашки в зависимости от длины текста
         let font = label.font ?? NSFont.systemFont(ofSize: 13)
         let textWidth = (suggestion as NSString).size(withAttributes: [.font: font]).width
-        let panelWidth = min(max(textWidth + 80, 160), 450)
+        let panelWidth = min(max(textWidth + 145, 230), 550)
         let panelHeight: CGFloat = 36
 
         // Позиционирование рядом с кареткой
@@ -130,6 +133,36 @@ public final class OverlayController {
         } else {
             panel.alphaValue = 1.0
         }
+    }
+
+    public func updateSuggestionText(_ newSuggestion: String, at newCaret: CGRect? = nil) {
+        guard isVisible, let panel, let label = suggestionLabel else { return }
+        self.currentSuggestion = newSuggestion
+        label.stringValue = newSuggestion
+
+        if let newCaret {
+            self.lastCaretCocoa = newCaret
+        }
+
+        let caret = self.lastCaretCocoa ?? CGRect(x: 100, y: 100, width: 2, height: 16)
+        let font = label.font ?? NSFont.systemFont(ofSize: 13)
+        let textWidth = (newSuggestion as NSString).size(withAttributes: [.font: font]).width
+        let panelWidth = min(max(textWidth + 145, 230), 550)
+        let panelHeight: CGFloat = 36
+
+        var x = caret.origin.x + 4
+        var y = caret.origin.y - panelHeight - 6
+
+        if let screen = NSScreen.screens.first(where: { $0.frame.contains(caret.origin) }) ?? NSScreen.main {
+            let maxX = screen.frame.maxX - panelWidth - 10
+            let minX = screen.frame.minX + 10
+            x = max(minX, min(x, maxX))
+            if y < screen.frame.minY + 10 {
+                y = caret.origin.y + caret.height + 6
+            }
+        }
+
+        panel.setFrame(NSRect(x: x, y: y, width: panelWidth, height: panelHeight), display: true)
     }
 
     public func hide() {

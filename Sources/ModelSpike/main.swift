@@ -79,12 +79,13 @@ do {
 let loadTime = Date().timeIntervalSince(startLoad)
 print("Model loaded successfully in \(String(format: "%.2f", loadTime))s")
 
-// Test prompts for Step 0.2: Causal continuation (no instructions)
+// Test prompts for Step 0.2: Causal continuation vs Priming
 let prompts = [
-    "Я могу ",
-    "Проверить статус pull request ",
-    "The meeting is scheduled for ",
-    "После согласования плана мы приступим к "
+    "Как дела? ",
+    "Переписка:\n— Привет! Как дела? ",
+    "Чат друзей:\n— Привет! Как дела? ",
+    "Диалог:\n— Привет!\n— Привет, как дела?\n— Нормально, а у тебя?\n— Тоже хорошо. Как дела? ",
+    "Я пишу сообщение коллеге: Как дела? "
 ]
 
 for (index, prompt) in prompts.enumerated() {
@@ -98,10 +99,10 @@ for (index, prompt) in prompts.enumerated() {
             
             let input = LMInput(tokens: MLXArray(promptTokens))
             var params = GenerateParameters()
-            params.maxTokens = 32
-            params.temperature = 0.0 // deterministic per SPEC §9
-            params.repetitionPenalty = 1.1
-            params.repetitionContextSize = 64
+            params.maxTokens = 15
+            params.temperature = 0.6
+            params.topP = 0.9
+            params.repetitionPenalty = 1.0
             
             let startGen = Date()
             var firstTokenTime: TimeInterval?

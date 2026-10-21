@@ -111,9 +111,10 @@ public final class InferenceService {
 
                     let input = LMInput(tokens: MLXArray(promptTokens))
                     var params = GenerateParameters()
-                    params.maxTokens = maxTokens
-                    params.temperature = 0.0 // Детерминированная базовая генерация per SPEC §9
-                    params.repetitionPenalty = 1.1
+                    params.maxTokens = 16
+                    params.temperature = 0.4
+                    params.topP = 0.9
+                    params.repetitionPenalty = 1.05
                     params.repetitionContextSize = 64
 
                     let stream = try generate(
@@ -131,24 +132,28 @@ public final class InferenceService {
                         case .chunk(let tokenText):
                             generatedText += tokenText
 
-                            // Ограничиваемся одной фразой / строкой для чистой автоподстановки
+                            // Ограничиваемся одной строкой
                             if generatedText.contains("\n") {
-                                let lines = generatedText.components(separatedBy: "\n")
-                                return lines.first?.trimmingCharacters(in: .whitespaces)
+                                let line = generatedText.components(separatedBy: "\n").first ?? ""
+                                return Self.formatSuggestion(line, prompt: trimmedPrompt, maxWords: 4)
                             }
 
-                            // Если предложение логически завершено точкой, знаком вопроса или восклицания
-                            if generatedText.count >= 8,
-                               tokenText.contains(".") || tokenText.contains("?") || tokenText.contains("!") {
-                                return generatedText
+                            // Проверяем количество сгенерированных слов
+                            let words = generatedText.split(whereSeparator: { $0.isWhitespace })
+                            if words.count >= 4 {
+                                return Self.formatSuggestion(generatedText, prompt: trimmedPrompt, maxWords: 4)
+                            }
+
+                            // Если предложение завершено пунктуацией
+                            if words.count >= 1, tokenText.contains(".") || tokenText.contains("?") || tokenText.contains("!") {
+                                return Self.formatSuggestion(generatedText, prompt: trimmedPrompt, maxWords: 4)
                             }
                         default:
                             break
                         }
                     }
 
-                    let cleaned = generatedText.trimmingCharacters(in: .newlines)
-                    return cleaned.isEmpty ? nil : cleaned
+                    return Self.formatSuggestion(generatedText, prompt: trimmedPrompt, maxWords: 4)
                 }
             } catch {
                 if !Task.isCancelled {
@@ -165,5 +170,48 @@ public final class InferenceService {
     public func cancelCurrentGeneration() {
         currentTask?.cancel()
         currentTask = nil
+    }
+
+    nonisolated private static func formatSuggestion(_ text: String, prompt: String, maxWords: Int) -> String? {
+        var cleaned = text.trimmingCharacters(in: .newlines)
+
+        let promptHasTrailingSpace = prompt.hasSuffix(" ") || prompt.hasSuffix("\t")
+
+        if promptHasTrailingSpace {
+            // Пользователь уже нажал пробел после предыдущего слова:
+            // Убираем возможный дублирующий начальный пробел из генерации модели
+            while cleaned.hasPrefix(" ") {
+                cleaned.removeFirst()
+            }
+        } else {
+            // Пользователь печатает слово (пробела в конце промпта нет).
+            // Модель должна продолжать текущее слово:
+            // Убираем пробелы, чтобы окончание приклеивалось ровно к напечатанной части слова
+            while cleaned.hasPrefix(" ") {
+                cleaned.removeFirst()
+            }
+        }
+
+        let words = cleaned.split(whereSeparator: { $0.isWhitespace })
+        guard !words.isEmpty else { return nil }
+
+        // Ограничиваем от 1 до maxWords слов
+        let limitedWords = words.prefix(maxWords)
+        let joined = limitedWords.joined(separator: " ")
+
+        // Фильтруем численные артефакты (например, "10", "10,", "2022 год")
+        if let firstWord = limitedWords.first {
+            let stripped = firstWord.trimmingCharacters(in: .punctuationCharacters)
+            if !stripped.isEmpty && stripped.allSatisfy({ $0.isNumber }) {
+                return nil
+            }
+        }
+
+        let result = joined.trimmingCharacters(in: .whitespacesAndNewlines)
+        if Double(result) != nil {
+            return nil
+        }
+
+        return result.isEmpty ? nil : result
     }
 }

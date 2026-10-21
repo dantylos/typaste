@@ -27,6 +27,8 @@ public final class AssistantCoordinator {
         }
     }
 
+    private var isCompletingWord: Bool = false
+
     public func setEnabled(_ enabled: Bool) {
         self.isEnabled = enabled
         if !enabled {
@@ -36,18 +38,110 @@ public final class AssistantCoordinator {
     }
 
     private func setupEventTap() {
-        // Обработка клавиши Tab
+        // Обработка клавиши Tab: принять по одному слову
         EventTapManager.shared.onTab = { [weak self] in
             guard let self, self.isEnabled else { return false }
-            if OverlayController.shared.isVisible,
-               let suggestion = OverlayController.shared.currentSuggestion,
-               let el = self.currentElement {
-                NSLog("[AssistantCoordinator] Tab pressed! Inserting: %@", suggestion)
-                let success = AXAdapter.shared.insert(text: suggestion, into: el)
-                OverlayController.shared.hide()
-                return success
+
+            // Полностью игнорируем Orion
+            if let snap = AXAdapter.shared.currentSnapshot(),
+               snap.bundleID == "com.kagi.kagimacOS" || snap.appName.localizedCaseInsensitiveContains("orion") {
+                return false
             }
-            return false
+
+            guard OverlayController.shared.isVisible,
+                  let fullSuggestion = OverlayController.shared.currentSuggestion else {
+                return false
+            }
+
+            let snap = AXAdapter.shared.currentSnapshot()
+            guard let el = snap?.element ?? self.currentElement else {
+                return false
+            }
+
+            let beforeCaret = snap?.beforeCaret ?? self.lastPrompt
+            let endsWithSpace = beforeCaret.hasSuffix(" ") || beforeCaret.hasSuffix("\t") || beforeCaret.hasSuffix("\n")
+
+            guard let (word, remainder) = self.extractNextWord(from: fullSuggestion) else {
+                OverlayController.shared.hide()
+                return false
+            }
+
+            let textToInsert: String
+            if self.isCompletingWord {
+                // Допечатываем половину слова: никаких пробелов ни до, ни после!
+                textToInsert = word
+                self.isCompletingWord = false
+            } else if endsWithSpace || beforeCaret.isEmpty {
+                // Пробел уже напечатан пользователем
+                textToInsert = word
+            } else {
+                // Новое слово после символа без пробела
+                textToInsert = " " + word
+            }
+
+            NSLog("[AssistantCoordinator] Tab pressed! Inserting: '%@'", textToInsert)
+            let success = AXAdapter.shared.insert(text: textToInsert, into: el)
+
+            let trimmedRemainder = remainder.trimmingCharacters(in: .whitespacesAndNewlines)
+            if success && !trimmedRemainder.isEmpty {
+                // Мгновенно обновляем текст подсказки в плашке
+                OverlayController.shared.updateSuggestionText(remainder)
+
+                // Через 60 мс мягко уточняем экранную позицию каретки
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+                    if let freshSnapshot = AXAdapter.shared.currentSnapshot() {
+                        self.currentElement = freshSnapshot.element
+                        self.lastPrompt = freshSnapshot.beforeCaret
+                        if let freshCaret = freshSnapshot.caretRectCocoa {
+                            OverlayController.shared.updateSuggestionText(remainder, at: freshCaret)
+                        }
+                    }
+                }
+            } else {
+                OverlayController.shared.hide()
+            }
+
+            return success
+        }
+
+        // Обработка клавиши Shift+Tab: принять всю подсказку целиком
+        EventTapManager.shared.onShiftTab = { [weak self] in
+            guard let self, self.isEnabled else { return false }
+
+            // Полностью игнорируем Orion
+            if let snap = AXAdapter.shared.currentSnapshot(),
+               snap.bundleID == "com.kagi.kagimacOS" || snap.appName.localizedCaseInsensitiveContains("orion") {
+                return false
+            }
+
+            guard OverlayController.shared.isVisible,
+                  let fullSuggestion = OverlayController.shared.currentSuggestion else {
+                return false
+            }
+
+            let snap = AXAdapter.shared.currentSnapshot()
+            guard let el = snap?.element ?? self.currentElement else {
+                return false
+            }
+
+            let beforeCaret = snap?.beforeCaret ?? self.lastPrompt
+            let endsWithSpace = beforeCaret.hasSuffix(" ") || beforeCaret.hasSuffix("\t") || beforeCaret.hasSuffix("\n")
+
+            let cleanedSuggestion = fullSuggestion.trimmingCharacters(in: .whitespaces)
+            let textToInsert: String
+            if self.isCompletingWord {
+                textToInsert = cleanedSuggestion
+            } else if endsWithSpace || beforeCaret.isEmpty {
+                textToInsert = cleanedSuggestion
+            } else {
+                textToInsert = " " + cleanedSuggestion
+            }
+            self.isCompletingWord = false
+
+            NSLog("[AssistantCoordinator] Shift+Tab pressed! Inserting all: '%@'", textToInsert)
+            let success = AXAdapter.shared.insert(text: textToInsert, into: el)
+            OverlayController.shared.hide()
+            return success
         }
 
         // Обработка клавиши Escape
@@ -91,6 +185,11 @@ public final class AssistantCoordinator {
             return
         }
 
+        // Подсказки в браузере Orion полностью отключены по требованию пользователя
+        if snapshot.bundleID == "com.kagi.kagimacOS" || snapshot.appName.localizedCaseInsensitiveContains("orion") {
+            return
+        }
+
         let beforeCaret = snapshot.beforeCaret
         let trimmed = beforeCaret.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -107,6 +206,13 @@ public final class AssistantCoordinator {
         self.currentElement = snapshot.element
         self.lastPrompt = beforeCaret
 
+        // Определяем, допечатывает ли пользователь половину слова
+        let isMidWord = !beforeCaret.isEmpty
+            && !beforeCaret.hasSuffix(" ")
+            && !beforeCaret.hasSuffix("\t")
+            && !beforeCaret.hasSuffix("\n")
+        self.isCompletingWord = isMidWord
+
         // Запуск инференса на GPU/Metal
         guard let suggestion = await inferenceService.generateSuggestion(for: beforeCaret, maxTokens: 20) else {
             return
@@ -121,5 +227,31 @@ public final class AssistantCoordinator {
 
         // Показываем плашку с подсказкой рядом с курсором
         OverlayController.shared.show(suggestion: suggestion, at: latestCocoaCaret)
+    }
+
+    private func extractNextWord(from text: String) -> (word: String, remainder: String)? {
+        guard !text.isEmpty else { return nil }
+
+        // Отбрасываем любые начальные пробелы
+        let trimmedLeading = text.drop(while: { $0.isWhitespace })
+        guard !trimmedLeading.isEmpty else { return nil }
+
+        var wordEnd = trimmedLeading.startIndex
+        while wordEnd < trimmedLeading.endIndex && !trimmedLeading[wordEnd].isWhitespace {
+            wordEnd = trimmedLeading.index(after: wordEnd)
+        }
+
+        let word = String(trimmedLeading[..<wordEnd])
+        var remainder = String(trimmedLeading[wordEnd...])
+
+        // Если в остатке есть символы, гарантируем аккуратный пробел перед следующим словом
+        let trimmedRemainder = remainder.trimmingCharacters(in: .whitespaces)
+        if !trimmedRemainder.isEmpty {
+            remainder = " " + trimmedRemainder
+        } else {
+            remainder = ""
+        }
+
+        return (word, remainder)
     }
 }

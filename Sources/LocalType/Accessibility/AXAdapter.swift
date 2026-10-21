@@ -74,12 +74,78 @@ public final class AXAdapter {
     }
 
     public func insert(text: String, into element: AXUIElement) -> Bool {
+        // Запоминаем текущее значение поля перед попыткой вставки
+        var beforeRef: CFTypeRef?
+        let hadValue = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &beforeRef) == .success
+        let beforeVal = beforeRef as? String
+
+        // Tier 1 (SPEC §7): Прямая вставка через kAXSelectedTextAttribute
         let error = AXUIElementSetAttributeValue(
             element,
             kAXSelectedTextAttribute as CFString,
             text as CFString
         )
-        return error == .success
+        if error == .success {
+            return true
+        }
+
+        // Проверяем: многие приложения (включая Telegram macOS) успешно применяют вставку
+        // через kAXSelectedTextAttribute, но возвращают ошибку -25200 (kAXErrorFailure).
+        // Если значение поля изменилось — вставка фактически удалась, Tier 2 вызывать НЕ нужно!
+        if hadValue, let before = beforeVal {
+            var afterRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &afterRef) == .success,
+               let after = afterRef as? String,
+               after != before {
+                NSLog("[AXAdapter] Tier 1 returned error %d, but AXValue changed. Insertion succeeded, skipping Tier 2 clipboard paste.", error.rawValue)
+                return true
+            }
+        }
+
+        NSLog("[AXAdapter] Tier 1 insert failed with error %d, engaging Tier 2 fallback", error.rawValue)
+        return insertViaTransientClipboard(text)
+    }
+
+    private func insertViaTransientClipboard(_ text: String) -> Bool {
+        let pasteboard = NSPasteboard.general
+        let previousChangeCount = pasteboard.changeCount
+        let previousString = pasteboard.string(forType: .string)
+
+        pasteboard.clearContents()
+        guard pasteboard.setString(text, forType: .string) else {
+            return false
+        }
+
+        // Эмулируем сочетание клавиш Cmd+V
+        let src = CGEventSource(stateID: .combinedSessionState)
+        let cmdKeyCode: CGKeyCode = 55 // kVK_Command
+        let vKeyCode: CGKeyCode = 9 // ANSI virtual key code for 'V'
+        guard let cmdDown = CGEvent(keyboardEventSource: src, virtualKey: cmdKeyCode, keyDown: true),
+              let vDown = CGEvent(keyboardEventSource: src, virtualKey: vKeyCode, keyDown: true),
+              let vUp = CGEvent(keyboardEventSource: src, virtualKey: vKeyCode, keyDown: false),
+              let cmdUp = CGEvent(keyboardEventSource: src, virtualKey: cmdKeyCode, keyDown: false) else {
+            return false
+        }
+
+        cmdDown.flags = .maskCommand
+        vDown.flags = .maskCommand
+        vUp.flags = .maskCommand
+        cmdUp.flags = []
+
+        cmdDown.post(tap: .cghidEventTap)
+        vDown.post(tap: .cghidEventTap)
+        vUp.post(tap: .cghidEventTap)
+        cmdUp.post(tap: .cghidEventTap)
+
+        // Восстанавливаем оригинальный буфер обмена пользователя
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            if pasteboard.changeCount == previousChangeCount + 1, let previous = previousString {
+                pasteboard.clearContents()
+                pasteboard.setString(previous, forType: .string)
+            }
+        }
+
+        return true
     }
 
     // MARK: - Private Helpers
