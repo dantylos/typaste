@@ -1,0 +1,9 @@
+.DS_Store
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj/xcuserdata/
+Models/**/*.safetensors
+Models/**/*.bin
+Models/**/*.mlx
+.venv/
