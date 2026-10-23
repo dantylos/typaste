@@ -12,6 +12,26 @@ public struct TextSnapshot {
     public let selectedRange: CFRange
     public let caretRectAX: CGRect?
     public let caretRectCocoa: CGRect?
+
+    public init(
+        element: AXUIElement,
+        appName: String,
+        bundleID: String,
+        beforeCaret: String,
+        afterCaret: String,
+        selectedRange: CFRange,
+        caretRectAX: CGRect?,
+        caretRectCocoa: CGRect?
+    ) {
+        self.element = element
+        self.appName = appName
+        self.bundleID = bundleID
+        self.beforeCaret = beforeCaret
+        self.afterCaret = afterCaret
+        self.selectedRange = selectedRange
+        self.caretRectAX = caretRectAX
+        self.caretRectCocoa = caretRectCocoa
+    }
 }
 
 @MainActor
@@ -21,7 +41,24 @@ public final class AXAdapter {
     /// Короткий таймаут для вызовов из колбэка CGEventTap (не блокируем ввод всей системы).
     private let fastTimeout: Float = 0.08
 
+    /// Позволяет подменять отправку клавиш Cmd+V в интеграционных тестах без генерации HID-событий в активное окно.
+    internal var postKeyboardPaste: @MainActor () -> Bool = { AXAdapter.defaultPostKeyboardPaste() }
+
     private init() {}
+
+    /// Разрезает строку по UTF-16 диапазону выделения (`kAXSelectedTextRangeAttribute`).
+    internal static func sliceText(_ fullText: String, selectedRange: CFRange) -> (before: String, after: String)? {
+        let nsString = fullText as NSString
+        let loc = selectedRange.location
+        let len = selectedRange.length
+        guard loc >= 0, len >= 0, loc <= nsString.length else { return nil }
+
+        let beforeCaret = nsString.substring(to: loc)
+        let afterCaret = (loc + len <= nsString.length)
+            ? nsString.substring(from: loc + len)
+            : ""
+        return (beforeCaret, afterCaret)
+    }
 
     /// - Parameter fast: короткий AX-таймаут и без расчёта экранного прямоугольника каретки.
     public func currentSnapshot(fast: Bool = false) -> TextSnapshot? {
@@ -52,24 +89,17 @@ public final class AXAdapter {
         var range = CFRange()
         guard AXValueGetValue(axVal, .cfRange, &range) else { return nil }
 
-        let nsString = fullText as NSString
-        let loc = range.location
-        guard loc >= 0, loc <= nsString.length else { return nil }
+        guard let sliced = Self.sliceText(fullText, selectedRange: range) else { return nil }
 
-        let beforeCaret = nsString.substring(to: loc)
-        let afterCaret = (loc + range.length <= nsString.length)
-            ? nsString.substring(from: loc + range.length)
-            : ""
-
-        let axCaret = fast ? nil : calculateCaretRect(el: el, location: loc, fullText: fullText)
+        let axCaret = fast ? nil : calculateCaretRect(el: el, location: range.location, fullText: fullText)
         let cocoaCaret = axCaret.map { convertAXToCocoa(axRect: $0) }
 
         return TextSnapshot(
             element: el,
             appName: app?.localizedName ?? "Unknown",
             bundleID: app?.bundleIdentifier ?? "Unknown",
-            beforeCaret: beforeCaret,
-            afterCaret: afterCaret,
+            beforeCaret: sliced.before,
+            afterCaret: sliced.after,
             selectedRange: range,
             caretRectAX: axCaret,
             caretRectCocoa: cocoaCaret
@@ -77,17 +107,37 @@ public final class AXAdapter {
     }
 
     public func insert(text: String, into element: AXUIElement) -> Bool {
+        insert(
+            text: text,
+            into: element,
+            axSetSelectedText: { el, str in
+                AXUIElementSetAttributeValue(el, kAXSelectedTextAttribute as CFString, str as CFString)
+            },
+            axCopyValue: { el in
+                var ref: CFTypeRef?
+                guard AXUIElementCopyAttributeValue(el, kAXValueAttribute as CFString, &ref) == .success else {
+                    return nil
+                }
+                return ref as? String
+            },
+            fallbackPaste: { [weak self] str in
+                self?.insertViaTransientClipboard(str) ?? false
+            }
+        )
+    }
+
+    internal func insert(
+        text: String,
+        into element: AXUIElement,
+        axSetSelectedText: (AXUIElement, String) -> AXError,
+        axCopyValue: (AXUIElement) -> String?,
+        fallbackPaste: (String) -> Bool
+    ) -> Bool {
         // Запоминаем текущее значение поля перед попыткой вставки
-        var beforeRef: CFTypeRef?
-        let hadValue = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &beforeRef) == .success
-        let beforeVal = beforeRef as? String
+        let beforeVal = axCopyValue(element)
 
         // Tier 1 (SPEC §7): Прямая вставка через kAXSelectedTextAttribute
-        let error = AXUIElementSetAttributeValue(
-            element,
-            kAXSelectedTextAttribute as CFString,
-            text as CFString
-        )
+        let error = axSetSelectedText(element, text)
         if error == .success {
             return true
         }
@@ -95,22 +145,20 @@ public final class AXAdapter {
         // Проверяем: многие приложения (включая Telegram macOS) успешно применяют вставку
         // через kAXSelectedTextAttribute, но возвращают ошибку -25200 (kAXErrorFailure).
         // Если значение поля изменилось — вставка фактически удалась, Tier 2 вызывать НЕ нужно!
-        if hadValue, let before = beforeVal {
-            var afterRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &afterRef) == .success,
-               let after = afterRef as? String,
-               after != before {
-                NSLog("[AXAdapter] Tier 1 returned error %d, but AXValue changed. Insertion succeeded, skipping Tier 2 clipboard paste.", error.rawValue)
-                return true
-            }
+        if let before = beforeVal, let after = axCopyValue(element), after != before {
+            NSLog("[AXAdapter] Tier 1 returned error %d, but AXValue changed. Insertion succeeded, skipping Tier 2 clipboard paste.", error.rawValue)
+            return true
         }
 
         NSLog("[AXAdapter] Tier 1 insert failed with error %d, engaging Tier 2 fallback", error.rawValue)
-        return insertViaTransientClipboard(text)
+        return fallbackPaste(text)
     }
 
-    private func insertViaTransientClipboard(_ text: String) -> Bool {
-        let pasteboard = NSPasteboard.general
+    internal func insertViaTransientClipboard(
+        _ text: String,
+        pasteboard: NSPasteboard = .general,
+        restoreDelay: TimeInterval = 0.15
+    ) -> Bool {
         // Полная копия буфера (все элементы и типы), а не только строки.
         let backup: [[NSPasteboard.PasteboardType: Data]] = (pasteboard.pasteboardItems ?? []).map { item in
             var dict: [NSPasteboard.PasteboardType: Data] = [:]
@@ -126,7 +174,27 @@ public final class AXAdapter {
         }
         let ourChangeCount = pasteboard.changeCount
 
-        // Эмулируем сочетание клавиш Cmd+V
+        guard postKeyboardPaste() else {
+            return false
+        }
+
+        // Восстанавливаем оригинальный буфер, только если его никто не менял после нас
+        DispatchQueue.main.asyncAfter(deadline: .now() + restoreDelay) {
+            guard pasteboard.changeCount == ourChangeCount else { return }
+            pasteboard.clearContents()
+            guard !backup.isEmpty else { return }
+            let items: [NSPasteboardItem] = backup.map { dict in
+                let item = NSPasteboardItem()
+                for (type, data) in dict { item.setData(data, forType: type) }
+                return item
+            }
+            pasteboard.writeObjects(items)
+        }
+
+        return true
+    }
+
+    private static func defaultPostKeyboardPaste() -> Bool {
         let src = CGEventSource(stateID: .combinedSessionState)
         let cmdKeyCode: CGKeyCode = 55 // kVK_Command
         let vKeyCode: CGKeyCode = 9 // ANSI virtual key code for 'V'
@@ -146,20 +214,6 @@ public final class AXAdapter {
         vDown.post(tap: .cghidEventTap)
         vUp.post(tap: .cghidEventTap)
         cmdUp.post(tap: .cghidEventTap)
-
-        // Восстанавливаем оригинальный буфер, только если его никто не менял после нас
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            guard pasteboard.changeCount == ourChangeCount else { return }
-            pasteboard.clearContents()
-            guard !backup.isEmpty else { return }
-            let items: [NSPasteboardItem] = backup.map { dict in
-                let item = NSPasteboardItem()
-                for (type, data) in dict { item.setData(data, forType: type) }
-                return item
-            }
-            pasteboard.writeObjects(items)
-        }
-
         return true
     }
 
@@ -244,12 +298,11 @@ public final class AXAdapter {
         return rect
     }
 
-    private func convertAXToCocoa(axRect: CGRect) -> CGRect {
+    internal func convertAXToCocoa(axRect: CGRect, primaryScreenHeight: CGFloat? = nil) -> CGRect {
         // Главный экран NSScreen определяет начало глобальной системы координат (0,0 слева внизу)
-        guard let primaryScreen = NSScreen.screens.first else {
+        guard let primaryHeight = primaryScreenHeight ?? NSScreen.screens.first?.frame.height else {
             return axRect
         }
-        let primaryHeight = primaryScreen.frame.height
         let cocoaY = primaryHeight - axRect.origin.y - axRect.size.height
         return CGRect(x: axRect.origin.x, y: cocoaY, width: axRect.size.width, height: axRect.size.height)
     }

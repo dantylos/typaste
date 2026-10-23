@@ -13,6 +13,9 @@ public final class OverlayController {
     public private(set) var isVisible: Bool = false
     public private(set) var currentSuggestion: String?
 
+    internal var panelFrame: NSRect? { panel?.frame }
+    internal var displayedLabelText: String? { suggestionLabel?.stringValue }
+
     private init() {
         setupPanel()
     }

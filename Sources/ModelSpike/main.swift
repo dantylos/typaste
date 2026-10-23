@@ -56,9 +56,9 @@ private struct LocalTransformersTokenizerLoader: MLXLMCommon.TokenizerLoader {
 
 // MARK: - Step 0.1 & 0.2 Spike Runner
 
-print("=== LocalType ModelSpike: Qwen3-1.7B-Base 4-bit ===")
+print("=== LocalType ModelSpike: Qwen3-1.7B-Instruct 4-bit (No-Think) ===")
 
-let modelDir = URL(fileURLWithPath: "Models/Qwen3-1.7B-Base-mlx-4Bit")
+let modelDir = URL(fileURLWithPath: "Models/Qwen3-1.7B-mlx-4Bit")
 guard FileManager.default.fileExists(atPath: modelDir.appendingPathComponent("model.safetensors").path) else {
     print("ERROR: model.safetensors not found in \(modelDir.path)")
     exit(1)
@@ -79,42 +79,40 @@ do {
 let loadTime = Date().timeIntervalSince(startLoad)
 print("Model loaded successfully in \(String(format: "%.2f", loadTime))s")
 
-// Test prompts for Step 0.2: Causal continuation vs Priming
 let prompts = [
     "Как дела? ",
-    "Переписка:\n— Привет! Как дела? ",
-    "Чат друзей:\n— Привет! Как дела? ",
-    "Диалог:\n— Привет!\n— Привет, как дела?\n— Нормально, а у тебя?\n— Тоже хорошо. Как дела? ",
-    "Я пишу сообщение коллеге: Как дела? "
+    "Привет! Давай сегодня ",
+    "Thank you for your message, I will "
 ]
 
 for (index, prompt) in prompts.enumerated() {
     print("\n--------------------------------------------------")
     print("Test [\(index + 1)/\(prompts.count)] Prompt: \"\(prompt)\"")
-    
+
     do {
         try await container.perform { context in
-            let promptTokens = context.tokenizer.encode(text: prompt, addSpecialTokens: false)
-            print("Prompt token IDs: \(promptTokens)")
-            
+            let instructPrompt = "<|im_start|>system\nContinue the user's text naturally without explanations.<|im_end|>\n<|im_start|>user\nContinue this text<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n\(prompt)"
+            let promptTokens = context.tokenizer.encode(text: instructPrompt, addSpecialTokens: false)
+            print("Prompt token count: \(promptTokens.count)")
+
             let input = LMInput(tokens: MLXArray(promptTokens))
             var params = GenerateParameters()
             params.maxTokens = 15
-            params.temperature = 0.6
-            params.topP = 0.9
-            params.repetitionPenalty = 1.0
-            
+            params.temperature = 0.0
+            params.topP = 1.0
+            params.repetitionPenalty = 1.1
+
             let startGen = Date()
             var firstTokenTime: TimeInterval?
             var generatedTokens = 0
             var generatedText = ""
-            
+
             let stream = try generate(
                 input: input,
                 parameters: params,
                 context: context
             )
-            
+
             for await item in stream {
                 switch item {
                 case .chunk(let text):
@@ -125,7 +123,7 @@ for (index, prompt) in prompts.enumerated() {
                     generatedText += text
                     print(text, terminator: "")
                     fflush(stdout)
-                    
+
                     if text.contains("\n") {
                         break
                     }

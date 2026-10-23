@@ -2,17 +2,18 @@ import AppKit
 import Foundation
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private var toggleItem: NSMenuItem?
     private var infoItem: NSMenuItem?
+    private var memoryItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
         setupStatusBar()
 
         AssistantCoordinator.shared.onStatusChange = { [weak self] status in
-            self?.infoItem?.title = "Qwen3-1.7B-Base 4-bit: \(status)"
+            self?.infoItem?.title = "Qwen3-1.7B-Instruct 4-bit: \(status)"
         }
 
         Task {
@@ -28,15 +29,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let menu = NSMenu()
+        menu.delegate = self
 
         let infoItem = NSMenuItem(
-            title: "Модель: Qwen3-1.7B-Base 4-bit (Metal)",
+            title: "Модель: Qwen3-1.7B-Instruct 4-bit (Metal)",
             action: nil,
             keyEquivalent: ""
         )
         infoItem.isEnabled = false
         menu.addItem(infoItem)
         self.infoItem = infoItem
+
+        let memoryItem = NSMenuItem(
+            title: "Личный словарь (SQLite): \(PersonalMemoryStore.shared.phraseCount()) фраз",
+            action: nil,
+            keyEquivalent: ""
+        )
+        memoryItem.isEnabled = false
+        menu.addItem(memoryItem)
+        self.memoryItem = memoryItem
 
         menu.addItem(NSMenuItem.separator())
 
@@ -49,6 +60,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toggle.state = .on
         menu.addItem(toggle)
         self.toggleItem = toggle
+
+        let clearMemoryItem = NSMenuItem(
+            title: "Очистить личный словарь",
+            action: #selector(clearMemory),
+            keyEquivalent: ""
+        )
+        clearMemoryItem.target = self
+        menu.addItem(clearMemoryItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -64,10 +83,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.statusItem = item
     }
 
+    func menuWillOpen(_ menu: NSMenu) {
+        let count = PersonalMemoryStore.shared.phraseCount()
+        memoryItem?.title = "Личный словарь (SQLite): \(count) фраз"
+    }
+
     @objc private func toggleEnabled(_ sender: NSMenuItem) {
         let newState = (sender.state == .on) ? NSControl.StateValue.off : NSControl.StateValue.on
         sender.state = newState
         AssistantCoordinator.shared.setEnabled(newState == .on)
+    }
+
+    @objc private func clearMemory() {
+        PersonalMemoryStore.shared.clearAll()
+        memoryItem?.title = "Личный словарь (SQLite): 0 фраз"
     }
 
     @objc private func quitApp() {

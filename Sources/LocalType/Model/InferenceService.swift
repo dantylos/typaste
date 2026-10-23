@@ -63,7 +63,8 @@ public final class InferenceService {
     private let modelDirectory: URL
     public private(set) var isReady: Bool = false
 
-    nonisolated public static let modelFolderName = "Qwen3-1.7B-Base-mlx-4Bit"
+    nonisolated public static let modelFolderName = "Qwen3-1.7B-mlx-4Bit"
+    nonisolated public static let legacyModelFolderName = "Qwen3-1.7B-Base-mlx-4Bit"
     nonisolated private static let maxPromptCharacters = 2048
     nonisolated private static let maxSuggestionWords = 4
 
@@ -76,6 +77,7 @@ public final class InferenceService {
         let fm = FileManager.default
         func isModel(_ url: URL) -> Bool {
             fm.fileExists(atPath: url.appendingPathComponent("config.json").path)
+                && fm.fileExists(atPath: url.appendingPathComponent("model.safetensors").path)
         }
 
         if let env = ProcessInfo.processInfo.environment["LOCALTYPE_MODEL_DIR"], !env.isEmpty {
@@ -83,9 +85,13 @@ public final class InferenceService {
             if isModel(url) { return url }
         }
 
+        let candidateNames = [modelFolderName, legacyModelFolderName]
+
         if let res = Bundle.main.resourceURL {
-            let url = res.appendingPathComponent("Models/\(modelFolderName)")
-            if isModel(url) { return url }
+            for name in candidateNames {
+                let url = res.appendingPathComponent("Models/\(name)")
+                if isModel(url) { return url }
+            }
         }
 
         var starts: [URL] = []
@@ -93,14 +99,17 @@ public final class InferenceService {
         starts.append(URL(fileURLWithPath: fm.currentDirectoryPath))
         // Dev/test-хосты (xctest и т.п.): путь исходника, зашитый при компиляции
         starts.append(URL(fileURLWithPath: sourceFile).deletingLastPathComponent())
-        for start in starts {
-            var dir = start
-            for _ in 0..<10 {
-                let url = dir.appendingPathComponent("Models/\(modelFolderName)")
-                if isModel(url) { return url }
-                let parent = dir.deletingLastPathComponent()
-                if parent == dir { break }
-                dir = parent
+
+        for name in candidateNames {
+            for start in starts {
+                var dir = start
+                for _ in 0..<10 {
+                    let url = dir.appendingPathComponent("Models/\(name)")
+                    if isModel(url) { return url }
+                    let parent = dir.deletingLastPathComponent()
+                    if parent == dir { break }
+                    dir = parent
+                }
             }
         }
 
@@ -127,14 +136,21 @@ public final class InferenceService {
         NSLog("[InferenceService] Model loaded successfully in %.2fs", elapsed)
     }
 
-    public func generateSuggestion(for prompt: String, maxTokens: Int = 20) async -> String? {
+    public func generateSuggestion(
+        for prompt: String,
+        styleExamples: [String] = [],
+        maxTokens: Int = 20
+    ) async -> String? {
         guard let container, isReady else {
             NSLog("[InferenceService] Model container is not ready")
             return nil
         }
 
-        // Отменяем любую незавершенную генерацию
-        currentTask?.cancel()
+        // Отменяем любую незавершенную генерацию и дожидаемся освобождения контейнера
+        if let previousTask = currentTask {
+            previousTask.cancel()
+            _ = await previousTask.value
+        }
 
         let task = Task<String?, Never> { [container] () -> String? in
             guard !Task.isCancelled else { return nil }
@@ -150,15 +166,21 @@ public final class InferenceService {
                         return nil
                     }
 
-                    let promptTokens = context.tokenizer.encode(text: trimmedPrompt, addSpecialTokens: false)
+                    // Формируем вход для Qwen3-1.7B-Instruct с отключенным <think> и примерами пользователя
+                    let instructInput = SuggestionText.buildInstructInput(
+                        prompt: trimmedPrompt,
+                        styleExamples: styleExamples
+                    )
+
+                    let promptTokens = context.tokenizer.encode(text: instructInput, addSpecialTokens: false)
                     guard !promptTokens.isEmpty, !Task.isCancelled else { return nil }
 
                     let input = LMInput(tokens: MLXArray(promptTokens))
                     var params = GenerateParameters()
                     params.maxTokens = maxTokens
-                    params.temperature = 0.4
-                    params.topP = 0.9
-                    params.repetitionPenalty = 1.05
+                    params.temperature = 0.0
+                    params.topP = 1.0
+                    params.repetitionPenalty = 1.1
                     params.repetitionContextSize = 64
 
                     let stream = try generate(
@@ -174,6 +196,14 @@ public final class InferenceService {
 
                         switch item {
                         case .chunk(let tokenText):
+                            if tokenText.contains("<|im_end|>") || tokenText.contains("<|endoftext|>") {
+                                let cleanToken = tokenText
+                                    .replacingOccurrences(of: "<|im_end|>", with: "")
+                                    .replacingOccurrences(of: "<|endoftext|>", with: "")
+                                generatedText += cleanToken
+                                return SuggestionText.format(generatedText, prompt: trimmedPrompt, maxWords: Self.maxSuggestionWords)
+                            }
+
                             generatedText += tokenText
 
                             // Ограничиваемся одной строкой

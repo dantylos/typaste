@@ -6,235 +6,356 @@ import Foundation
 public final class AssistantCoordinator {
     public static let shared = AssistantCoordinator()
 
-    /// Приложения, в которых подсказки полностью отключены.
-    private static let excludedBundleIDs: Set<String> = ["com.kagi.kagimacOS"]
-    private static let excludedNameFragments: [String] = ["orion"]
+    internal let snapshotProvider: @MainActor (_ fast: Bool) -> TextSnapshot?
+    internal let inserter: @MainActor (_ text: String, _ element: AXUIElement) -> Bool
+    internal let generateHandler: @MainActor (_ prompt: String, _ maxTokens: Int) async -> String?
+    internal let cancelGenerationHandler: @MainActor () -> Void
+    internal let overlayShow: @MainActor (_ suggestion: String, _ caret: CGRect) -> Void
+    internal let overlayUpdate: @MainActor (_ suggestion: String, _ caret: CGRect?) -> Void
+    internal let overlayHide: @MainActor () -> Void
+    internal let isOverlayVisible: @MainActor () -> Bool
+    internal let currentOverlaySuggestion: @MainActor () -> String?
+    internal let memoryStore: PersonalMemoryStore?
 
-    /// Состояние показанной подсказки. Привязано к элементу и тексту до каретки:
-    /// если фокус/текст изменились (мышь, другое поле), Tab не перехватывается.
-    private struct ActiveSuggestion {
-        var element: AXUIElement
+    private let ownedInferenceService: InferenceService?
+    private var debounceTimer: Timer?
+    internal let debounceInterval: TimeInterval
+    private var lastRecordedSentence: String?
+
+    /// Контекст, для которого была показана текущая подсказка.
+    /// Без этой привязки Tab/Shift+Tab могли вставлять устаревший текст после клика мышью,
+    /// смены окна или ввода в браузере (Orion).
+    internal struct ActiveSuggestion {
+        let element: AXUIElement
         var expectedBefore: String
         var isCompletingWord: Bool
     }
+    internal var active: ActiveSuggestion?
 
-    private let inferenceService = InferenceService()
-    private var debounceTimer: Timer?
-    private var active: ActiveSuggestion?
-    public private(set) var isEnabled: Bool = true
+    /// Приложения, где работа через общую AX-вставку пока отключена (SPEC §13: веб-редакторы Orion требуют отдельной матрицы).
+    private let excludedBundleIDs: Set<String> = [
+        "com.kagi.kagimacOS"
+    ]
+    private let excludedNameFragments: [String] = [
+        "orion"
+    ]
 
-    /// Человекочитаемый статус (для меню статус-бара).
+    public var isEnabled: Bool = true {
+        didSet {
+            if !isEnabled {
+                cancelAll()
+            }
+        }
+    }
+
     public var onStatusChange: ((String) -> Void)?
 
-    private init() {
-        setupEventTap()
+    public func setEnabled(_ enabled: Bool) {
+        isEnabled = enabled
+        onStatusChange?(enabled ? "Активна" : "На паузе")
+    }
+
+    private convenience init() {
+        let inference = InferenceService()
+        let memory = PersonalMemoryStore.shared
+        self.init(
+            ownedInferenceService: inference,
+            memoryStore: memory,
+            debounceInterval: 0.18,
+            snapshotProvider: { fast in AXAdapter.shared.currentSnapshot(fast: fast) },
+            inserter: { text, el in AXAdapter.shared.insert(text: text, into: el) },
+            generateHandler: { prompt, maxTokens in
+                let bundleID = AXAdapter.shared.currentSnapshot(fast: true)?.bundleID ?? "global"
+                let examples = memory.relevantStyleExamples(for: prompt, bundleID: bundleID, limit: 4)
+                return await inference.generateSuggestion(for: prompt, styleExamples: examples, maxTokens: maxTokens)
+            },
+            cancelGenerationHandler: { inference.cancelCurrentGeneration() },
+            overlayShow: { suggestion, caret in OverlayController.shared.show(suggestion: suggestion, at: caret) },
+            overlayUpdate: { suggestion, caret in OverlayController.shared.updateSuggestionText(suggestion, at: caret) },
+            overlayHide: { OverlayController.shared.hide() },
+            isOverlayVisible: { OverlayController.shared.isVisible },
+            currentOverlaySuggestion: { OverlayController.shared.currentSuggestion }
+        )
+    }
+
+    internal init(
+        ownedInferenceService: InferenceService?,
+        memoryStore: PersonalMemoryStore? = nil,
+        debounceInterval: TimeInterval,
+        snapshotProvider: @escaping @MainActor (_ fast: Bool) -> TextSnapshot?,
+        inserter: @escaping @MainActor (_ text: String, _ element: AXUIElement) -> Bool,
+        generateHandler: @escaping @MainActor (_ prompt: String, _ maxTokens: Int) async -> String?,
+        cancelGenerationHandler: @escaping @MainActor () -> Void,
+        overlayShow: @escaping @MainActor (_ suggestion: String, _ caret: CGRect) -> Void,
+        overlayUpdate: @escaping @MainActor (_ suggestion: String, _ caret: CGRect?) -> Void,
+        overlayHide: @escaping @MainActor () -> Void,
+        isOverlayVisible: @escaping @MainActor () -> Bool,
+        currentOverlaySuggestion: @escaping @MainActor () -> String?
+    ) {
+        self.ownedInferenceService = ownedInferenceService
+        self.memoryStore = memoryStore
+        self.debounceInterval = debounceInterval
+        self.snapshotProvider = snapshotProvider
+        self.inserter = inserter
+        self.generateHandler = generateHandler
+        self.cancelGenerationHandler = cancelGenerationHandler
+        self.overlayShow = overlayShow
+        self.overlayUpdate = overlayUpdate
+        self.overlayHide = overlayHide
+        self.isOverlayVisible = isOverlayVisible
+        self.currentOverlaySuggestion = currentOverlaySuggestion
     }
 
     public func start() async {
-        NSLog("[AssistantCoordinator] Starting assistant...")
-        onStatusChange?("Загрузка модели…")
+        // 1. Запрашиваем права Accessibility (с системным диалогом, если еще не выданы)
+        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+        let trusted = AXIsProcessTrustedWithOptions(options)
+        NSLog("[Coordinator] AXIsProcessTrusted = \(trusted)")
+
+        // 2. Загружаем модель Qwen3-1.7B Instruct в память GPU (Metal)
+        onStatusChange?("Загрузка модели...")
         do {
-            try await inferenceService.loadModel()
+            try await ownedInferenceService?.loadModel()
+            onStatusChange?("Готова (Metal)")
         } catch {
-            NSLog("[AssistantCoordinator] Failed to load model: %@", error.localizedDescription)
-            onStatusChange?("Ошибка модели: \(error.localizedDescription)")
-            return
-        }
-        NSLog("[AssistantCoordinator] Model ready. Starting EventTap...")
-        await ensureEventTap()
-    }
-
-    /// Запрашивает права один раз и повторяет создание tap, пока пользователь их не выдаст.
-    private func ensureEventTap() async {
-        if !AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary) {
-            NSLog("[AssistantCoordinator] Accessibility permission missing; prompting")
-        }
-        if !CGPreflightListenEventAccess() {
-            _ = CGRequestListenEventAccess()
+            NSLog("[Coordinator] Model load error: \(error)")
+            onStatusChange?("Ошибка модели")
         }
 
-        while !Task.isCancelled {
-            if EventTapManager.shared.start() {
-                onStatusChange?("Готово")
-                return
+        // 3. Запускаем перехват клавиш (Tab / Shift+Tab / Esc / Ввод текста)
+        setupEventTap()
+        if !EventTapManager.shared.start() {
+            onStatusChange?("Нужен доступ Accessibility")
+        }
+
+        // 4. При смене активного приложения скрываем подсказку
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.cancelAll()
             }
-            onStatusChange?("Нужны права: Универсальный доступ и Мониторинг ввода")
-            try? await Task.sleep(for: .seconds(2))
         }
     }
 
-    public func setEnabled(_ enabled: Bool) {
-        self.isEnabled = enabled
-        if !enabled {
-            debounceTimer?.invalidate()
-            active = nil
-            OverlayController.shared.hide()
-            inferenceService.cancelCurrentGeneration()
-        }
+    public func cancelAll() {
+        debounceTimer?.invalidate()
+        debounceTimer = nil
+        active = nil
+        cancelGenerationHandler()
+        overlayHide()
     }
 
-    private static func isExcluded(bundleID: String, appName: String) -> Bool {
+    internal func isExcluded(bundleID: String, appName: String) -> Bool {
         if excludedBundleIDs.contains(bundleID) { return true }
-        return excludedNameFragments.contains { appName.localizedCaseInsensitiveContains($0) }
+        let lower = appName.lowercased()
+        return excludedNameFragments.contains(where: { lower.contains($0) })
     }
 
-    /// Проверяет, что подсказка видна и всё ещё относится к тому же полю и тексту.
-    /// Вызывается из колбэка event tap: используются только быстрые AX-вызовы,
-    /// и только если подсказка действительно показана (иначе Tab проходит без AX-запросов).
-    private func validatedContext() -> (snapshot: TextSnapshot, active: ActiveSuggestion, suggestion: String)? {
-        guard isEnabled,
-              OverlayController.shared.isVisible,
-              let suggestion = OverlayController.shared.currentSuggestion,
-              let active else { return nil }
-
-        guard let snap = AXAdapter.shared.currentSnapshot(fast: true),
-              !Self.isExcluded(bundleID: snap.bundleID, appName: snap.appName),
-              CFEqual(snap.element, active.element),
-              snap.beforeCaret == active.expectedBefore else {
-            self.active = nil
-            OverlayController.shared.hide()
+    /// Проверяет, что фокус и текст до каретки всё ещё совпадают с моментом показа подсказки.
+    private func validatedContext() -> (ActiveSuggestion, TextSnapshot)? {
+        guard isOverlayVisible(),
+              let ctx = active,
+              let snap = snapshotProvider(true),
+              !isExcluded(bundleID: snap.bundleID, appName: snap.appName),
+              CFEqual(snap.element, ctx.element),
+              snap.beforeCaret == ctx.expectedBefore else {
+            active = nil
+            overlayHide()
             return nil
         }
-        return (snap, active, suggestion)
+        return (ctx, snap)
     }
 
-    private func setupEventTap() {
-        // Tab: принять одно слово
-        EventTapManager.shared.onTab = { [weak self] in
-            guard let self, let ctx = self.validatedContext() else { return false }
-
-            guard let (word, remainder) = SuggestionText.extractNextWord(from: ctx.suggestion) else {
-                self.active = nil
-                OverlayController.shared.hide()
-                return false
-            }
-
-            let before = ctx.snapshot.beforeCaret
-            // Пробел нужен только для нового слова после символа без пробела.
-            let needsSpace = SuggestionText.needsLeadingSpace(
-                beforeCaret: before, isCompletingWord: ctx.active.isCompletingWord)
-            let textToInsert = (needsSpace ? " " : "") + word
-
-            NSLog("[AssistantCoordinator] Tab pressed! Inserting: '%@'", textToInsert)
-            let success = AXAdapter.shared.insert(text: textToInsert, into: ctx.snapshot.element)
-
-            let trimmedRemainder = remainder.trimmingCharacters(in: .whitespacesAndNewlines)
-            if success && !trimmedRemainder.isEmpty {
-                self.active?.expectedBefore = before + textToInsert
-                self.active?.isCompletingWord = false
-                OverlayController.shared.updateSuggestionText(remainder)
-
-                // Через 60 мс мягко уточняем экранную позицию каретки
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
-                    if let fresh = AXAdapter.shared.currentSnapshot(), let caret = fresh.caretRectCocoa {
-                        OverlayController.shared.updateSuggestionText(remainder, at: caret)
-                    }
-                }
-            } else {
-                self.active = nil
-                OverlayController.shared.hide()
-            }
-            return success
-        }
-
-        // Shift+Tab: принять всю подсказку
-        EventTapManager.shared.onShiftTab = { [weak self] in
-            guard let self, let ctx = self.validatedContext() else { return false }
-
-            let cleaned = ctx.suggestion.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !cleaned.isEmpty else {
-                self.active = nil
-                OverlayController.shared.hide()
-                return false
-            }
-            let needsSpace = SuggestionText.needsLeadingSpace(
-                beforeCaret: ctx.snapshot.beforeCaret, isCompletingWord: ctx.active.isCompletingWord)
-            let textToInsert = (needsSpace ? " " : "") + cleaned
-
-            NSLog("[AssistantCoordinator] Shift+Tab pressed! Inserting all: '%@'", textToInsert)
-            let success = AXAdapter.shared.insert(text: textToInsert, into: ctx.snapshot.element)
-            self.active = nil
-            OverlayController.shared.hide()
-            return success
-        }
-
-        // Escape
-        EventTapManager.shared.onEscape = { [weak self] in
-            guard let self, self.isEnabled else { return false }
-            if OverlayController.shared.isVisible {
-                NSLog("[AssistantCoordinator] Escape pressed! Dismissing suggestion.")
-                self.active = nil
-                OverlayController.shared.hide()
-                self.inferenceService.cancelCurrentGeneration()
-                return true
-            }
+    /// Принимает следующее слово по `Tab` (возвращает `true`, если клавиша перехвачена).
+    internal func acceptNextWord() -> Bool {
+        guard let currentSuggestion = currentOverlaySuggestion(),
+              let (ctx, snap) = validatedContext() else {
             return false
         }
 
-        // Любой другой ввод
-        EventTapManager.shared.onTyping = { [weak self] keyCode in
+        guard let (firstWord, remainder) = SuggestionText.extractNextWord(from: currentSuggestion),
+              !firstWord.isEmpty else {
+            active = nil
+            overlayHide()
+            return false
+        }
+
+        let needsSpace = SuggestionText.needsLeadingSpace(
+            beforeCaret: snap.beforeCaret,
+            isCompletingWord: ctx.isCompletingWord
+        )
+        let textToInsert = needsSpace ? " " + firstWord : firstWord
+
+        guard inserter(textToInsert, ctx.element) else {
+            active = nil
+            overlayHide()
+            return false
+        }
+
+        let newBeforeCaret = snap.beforeCaret + textToInsert
+
+        if remainder.isEmpty {
+            let completedPhrase = PersonalMemoryStore.extractCurrentSentencePrefix(from: newBeforeCaret)
+            memoryStore?.recordPhrase(completedPhrase, bundleID: snap.bundleID, weight: 2)
+            active = nil
+            overlayHide()
+        } else {
+            var updated = ctx
+            updated.expectedBefore = newBeforeCaret
+            updated.isCompletingWord = false // следующие слова уже отдельные
+            active = updated
+
+            let displayRemainder = remainder.hasPrefix(" ") ? remainder : " " + remainder
+            overlayUpdate(displayRemainder, nil)
+            // Обновляем позицию плашки чуть позже (без блокировки EventTap)
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 60_000_000)
+                guard let self, self.isOverlayVisible(),
+                      let newSnap = self.snapshotProvider(false),
+                      let caret = newSnap.caretRectCocoa else { return }
+                self.overlayUpdate(displayRemainder, caret)
+            }
+        }
+        return true
+    }
+
+    /// Принимает всю подсказку по `Shift+Tab` (возвращает `true`, если клавиша перехвачена).
+    internal func acceptFullSuggestion() -> Bool {
+        guard let currentSuggestion = currentOverlaySuggestion(),
+              let (ctx, snap) = validatedContext() else {
+            return false
+        }
+
+        let trimmed = currentSuggestion.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else {
+            active = nil
+            overlayHide()
+            return false
+        }
+
+        let needsSpace = SuggestionText.needsLeadingSpace(
+            beforeCaret: snap.beforeCaret,
+            isCompletingWord: ctx.isCompletingWord
+        )
+        let textToInsert = needsSpace ? " " + trimmed : trimmed
+
+        active = nil
+        overlayHide()
+        if inserter(textToInsert, ctx.element) {
+            let newBeforeCaret = snap.beforeCaret + textToInsert
+            let completedPhrase = PersonalMemoryStore.extractCurrentSentencePrefix(from: newBeforeCaret)
+            memoryStore?.recordPhrase(completedPhrase, bundleID: snap.bundleID, weight: 2)
+        }
+        return true
+    }
+
+    /// Скрывает подсказку по `Esc` (возвращает `true`, если подсказка была видима).
+    internal func dismissSuggestion() -> Bool {
+        guard isOverlayVisible() else { return false }
+        active = nil
+        overlayHide()
+        return true
+    }
+
+    private func setupEventTap() {
+        let tap = EventTapManager.shared
+
+        tap.onTab = { [weak self] in
+            self?.acceptNextWord() ?? false
+        }
+
+        tap.onShiftTab = { [weak self] in
+            self?.acceptFullSuggestion() ?? false
+        }
+
+        tap.onEscape = { [weak self] in
+            self?.dismissSuggestion() ?? false
+        }
+
+        tap.onTyping = { [weak self] keyCode in
             guard let self, self.isEnabled else { return }
             self.handleUserTyping(keyCode: keyCode)
         }
     }
 
-    private func handleUserTyping(keyCode: CGKeyCode) {
+    internal func handleUserTyping(keyCode: Int64) {
+        // При любом нажатии клавиши сразу прячем старую подсказку и отменяем прошлую генерацию
         active = nil
-        if OverlayController.shared.isVisible {
-            OverlayController.shared.hide()
-        }
-        // Устаревшая генерация больше не нужна
-        inferenceService.cancelCurrentGeneration()
-
+        overlayHide()
+        cancelGenerationHandler()
         debounceTimer?.invalidate()
 
-        // Debounce ~180 мс после последнего нажатия клавиши
-        debounceTimer = Timer.scheduledTimer(withTimeInterval: 0.18, repeats: false) { [weak self] _ in
-            Task { @MainActor [weak self] in
+        // Стрелки (123..126) или функциональные клавиши — просто сбрасываем подсказку без запуска генерации
+        if (123...126).contains(keyCode) {
+            return
+        }
+
+        // Пауза после последнего нажатия клавиши перед запросом к модели (SPEC §6)
+        debounceTimer = Timer.scheduledTimer(withTimeInterval: debounceInterval, repeats: false) { [weak self] _ in
+            Task { @MainActor in
                 await self?.triggerSuggestion()
             }
         }
     }
 
-    private func triggerSuggestion() async {
+    internal func triggerSuggestion() async {
         guard isEnabled else { return }
-        guard let snapshot = AXAdapter.shared.currentSnapshot() else { return }
+        guard let snapshot = snapshotProvider(false) else { return }
+        guard !isExcluded(bundleID: snapshot.bundleID, appName: snapshot.appName) else { return }
 
-        if Self.isExcluded(bundleID: snapshot.bundleID, appName: snapshot.appName) { return }
+        let before = snapshot.beforeCaret
 
-        let beforeCaret = snapshot.beforeCaret
-        // Не вызываем модель на пустом поле или слишком коротком вводе (< 3 символов)
-        guard beforeCaret.trimmingCharacters(in: .whitespacesAndNewlines).count >= 3 else { return }
-        // Без экранных координат каретки плашку показать нельзя
-        guard snapshot.caretRectCocoa != nil else { return }
+        // Пассивное обучение с экрана: если пользователь только что завершил предложение (. ! ? или перевод строки),
+        // сохраняем его в локальную SQLite-память.
+        if let completedSentence = PersonalMemoryStore.extractCompletedSentence(from: before),
+           completedSentence != lastRecordedSentence {
+            lastRecordedSentence = completedSentence
+            memoryStore?.recordPhrase(completedSentence, bundleID: snapshot.bundleID, weight: 1)
+        }
 
-        let isMidWord = !(beforeCaret.last?.isWhitespace ?? true)
+        // Не предлагаем ничего, если поле пустое или слишком короткое
+        let trimmed = before.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 3 else { return }
 
-        let started = Date()
-        guard let suggestion = await inferenceService.generateSuggestion(for: beforeCaret, maxTokens: 20) else {
-            NSLog("[AssistantCoordinator] No suggestion for tail '%@'", String(beforeCaret.suffix(30)))
+        // Проверяем, что мы смогли вычислить экранные координаты каретки
+        guard let initialCaret = snapshot.caretRectCocoa else { return }
+
+        // 1. Быстрый путь (SQLite PersonalMemoryStore < 1 мс): проверяем точное совпадение частой фразы пользователя
+        if let memoryMatch = memoryStore?.matchPrefixContinuation(for: before, bundleID: snapshot.bundleID) {
+            let completingWord = !before.isEmpty && !before.last!.isWhitespace
+            active = ActiveSuggestion(
+                element: snapshot.element,
+                expectedBefore: before,
+                isCompletingWord: completingWord
+            )
+            overlayShow(memoryMatch, initialCaret)
             return
         }
-        NSLog("[AssistantCoordinator] Suggestion '%@' (%.0f ms) for tail '%@'",
-              suggestion, Date().timeIntervalSince(started) * 1000, String(beforeCaret.suffix(30)))
 
-        // За время инференса фокус и текст не должны измениться
-        guard isEnabled,
-              let latest = AXAdapter.shared.currentSnapshot(),
+        // 2. Генерация через Qwen3-1.7B-Instruct (с подстановкой релевантных фраз пользователя из SQLite)
+        guard let suggestion = await generateHandler(before, 20),
+              !Task.isCancelled else {
+            return
+        }
+
+        // Проверяем, что пользователь не изменил текст и не сменил фокус, пока модель думала
+        guard let latest = snapshotProvider(false),
+              !isExcluded(bundleID: latest.bundleID, appName: latest.appName),
               CFEqual(latest.element, snapshot.element),
-              latest.beforeCaret == beforeCaret,
-              let latestCocoaCaret = latest.caretRectCocoa else {
+              latest.beforeCaret == before,
+              let latestCaret = latest.caretRectCocoa else {
             return
         }
 
-        // Допечатываем слово, только если подсказка НЕ начинается с пробела (иначе модель начала новое слово)
-        let startsWithSpace = suggestion.first.map { $0 == " " || $0 == "\t" } ?? false
+        let completingWord = !before.isEmpty && !before.last!.isWhitespace
         active = ActiveSuggestion(
             element: latest.element,
-            expectedBefore: beforeCaret,
-            isCompletingWord: isMidWord && !startsWithSpace
+            expectedBefore: before,
+            isCompletingWord: completingWord
         )
-
-        OverlayController.shared.show(suggestion: suggestion, at: latestCocoaCaret)
+        overlayShow(suggestion, latestCaret)
     }
 }
