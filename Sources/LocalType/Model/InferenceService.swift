@@ -2,57 +2,7 @@ import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
-import Tokenizers
-
-// MARK: - Tokenizer Adapter (swift-transformers -> MLXLMCommon)
-
-private struct TransformersTokenizerBridge: MLXLMCommon.Tokenizer {
-    private let upstream: any Tokenizers.Tokenizer
-
-    init(_ upstream: any Tokenizers.Tokenizer) {
-        self.upstream = upstream
-    }
-
-    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
-        upstream.encode(text: text, addSpecialTokens: addSpecialTokens)
-    }
-
-    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
-        upstream.decode(tokens: tokenIds, skipSpecialTokens: skipSpecialTokens)
-    }
-
-    func convertTokenToId(_ token: String) -> Int? {
-        upstream.convertTokenToId(token)
-    }
-
-    func convertIdToToken(_ id: Int) -> String? {
-        upstream.convertIdToToken(id)
-    }
-
-    var bosToken: String? { upstream.bosToken }
-    var eosToken: String? { upstream.eosToken }
-    var unknownToken: String? { upstream.unknownToken }
-
-    func applyChatTemplate(
-        messages: [[String: any Sendable]],
-        tools: [[String: any Sendable]]?,
-        additionalContext: [String: any Sendable]?
-    ) throws -> [Int] {
-        do {
-            return try upstream.applyChatTemplate(
-                messages: messages, tools: tools, additionalContext: additionalContext)
-        } catch Tokenizers.TokenizerError.missingChatTemplate {
-            throw MLXLMCommon.TokenizerError.missingChatTemplate
-        }
-    }
-}
-
-private struct LocalTransformersTokenizerLoader: MLXLMCommon.TokenizerLoader {
-    func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
-        let upstream = try await Tokenizers.AutoTokenizer.from(modelFolder: directory)
-        return TransformersTokenizerBridge(upstream)
-    }
-}
+import ModelSupport
 
 // MARK: - InferenceService
 
@@ -60,6 +10,9 @@ private struct LocalTransformersTokenizerLoader: MLXLMCommon.TokenizerLoader {
 public final class InferenceService {
     private var container: ModelContainer?
     private var currentTask: Task<String?, Never>?
+    private var generationID = UUID()
+    private var currentTaskID: UUID?
+    internal var hasActiveGeneration: Bool { currentTask != nil }
     private let modelDirectory: URL
     public private(set) var isReady: Bool = false
 
@@ -146,12 +99,17 @@ public final class InferenceService {
             return nil
         }
 
+        guard !Task.isCancelled else { return nil }
+        let requestID = UUID()
+        generationID = requestID
+
         // Отменяем любую незавершенную генерацию и дожидаемся освобождения контейнера
         if let previousTask = currentTask {
             previousTask.cancel()
             _ = await previousTask.value
         }
 
+        guard generationID == requestID, !Task.isCancelled else { return nil }
         let task = Task<String?, Never> { [container] () -> String? in
             guard !Task.isCancelled else { return nil }
 
@@ -214,7 +172,7 @@ public final class InferenceService {
 
                             // Проверяем количество сгенерированных слов
                             let words = generatedText.split(whereSeparator: { $0.isWhitespace })
-                            if words.count >= 4 {
+                            if words.count > Self.maxSuggestionWords {
                                 return SuggestionText.format(generatedText, prompt: trimmedPrompt, maxWords: Self.maxSuggestionWords)
                             }
 
@@ -238,11 +196,23 @@ public final class InferenceService {
         }
 
         currentTask = task
-        return await task.value
+        currentTaskID = requestID
+        let result = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        if currentTaskID == requestID {
+            currentTask = nil
+            currentTaskID = nil
+        }
+        guard generationID == requestID else { return nil }
+        return Task.isCancelled ? nil : result
     }
 
     public func cancelCurrentGeneration() {
+        generationID = UUID()
         currentTask?.cancel()
-        currentTask = nil
+        // Keep the task until it finishes so the next request can await cleanup.
     }
 }

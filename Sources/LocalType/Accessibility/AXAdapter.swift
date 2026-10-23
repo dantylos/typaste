@@ -44,14 +44,34 @@ public final class AXAdapter {
     /// Позволяет подменять отправку клавиш Cmd+V в интеграционных тестах без генерации HID-событий в активное окно.
     internal var postKeyboardPaste: @MainActor () -> Bool = { AXAdapter.defaultPostKeyboardPaste() }
 
+    private struct ClipboardTransaction {
+        let backup: [[NSPasteboard.PasteboardType: Data]]
+        let changeCount: Int
+    }
+    private var clipboardTransactions: [NSPasteboard.Name: ClipboardTransaction] = [:]
+
     private init() {}
+
+    private func restoreClipboard(_ pasteboard: NSPasteboard, changeCount: Int) {
+        guard let transaction = clipboardTransactions[pasteboard.name],
+              transaction.changeCount == changeCount else { return }
+        clipboardTransactions[pasteboard.name] = nil
+        guard pasteboard.changeCount == changeCount else { return }
+        pasteboard.clearContents()
+        let items = transaction.backup.map { data in
+            let item = NSPasteboardItem()
+            for (type, value) in data { item.setData(value, forType: type) }
+            return item
+        }
+        if !items.isEmpty { pasteboard.writeObjects(items) }
+    }
 
     /// Разрезает строку по UTF-16 диапазону выделения (`kAXSelectedTextRangeAttribute`).
     internal static func sliceText(_ fullText: String, selectedRange: CFRange) -> (before: String, after: String)? {
         let nsString = fullText as NSString
         let loc = selectedRange.location
         let len = selectedRange.length
-        guard loc >= 0, len >= 0, loc <= nsString.length else { return nil }
+        guard loc >= 0, len >= 0, loc <= nsString.length, len <= nsString.length - loc else { return nil }
 
         let beforeCaret = nsString.substring(to: loc)
         let afterCaret = (loc + len <= nsString.length)
@@ -85,7 +105,7 @@ public final class AXAdapter {
             return nil
         }
 
-        let axVal = unsafeBitCast(selRangeVal, to: AXValue.self)
+        let axVal = unsafeDowncast(selRangeVal, to: AXValue.self)
         var range = CFRange()
         guard AXValueGetValue(axVal, .cfRange, &range) else { return nil }
 
@@ -160,7 +180,9 @@ public final class AXAdapter {
         restoreDelay: TimeInterval = 0.15
     ) -> Bool {
         // Полная копия буфера (все элементы и типы), а не только строки.
-        let backup: [[NSPasteboard.PasteboardType: Data]] = (pasteboard.pasteboardItems ?? []).map { item in
+        let previous = clipboardTransactions[pasteboard.name]
+        let savedBackup = previous.flatMap { $0.changeCount == pasteboard.changeCount ? $0.backup : nil }
+        let backup: [[NSPasteboard.PasteboardType: Data]] = savedBackup ?? (pasteboard.pasteboardItems ?? []).map { item in
             var dict: [NSPasteboard.PasteboardType: Data] = [:]
             for type in item.types {
                 if let data = item.data(forType: type) { dict[type] = data }
@@ -169,26 +191,20 @@ public final class AXAdapter {
         }
 
         pasteboard.clearContents()
-        guard pasteboard.setString(text, forType: .string) else {
-            return false
-        }
+        let wroteText = pasteboard.setString(text, forType: .string)
         let ourChangeCount = pasteboard.changeCount
-
-        guard postKeyboardPaste() else {
+        clipboardTransactions[pasteboard.name] = ClipboardTransaction(
+            backup: backup, changeCount: ourChangeCount
+        )
+        guard wroteText, postKeyboardPaste() else {
+            restoreClipboard(pasteboard, changeCount: ourChangeCount)
             return false
         }
 
-        // Восстанавливаем оригинальный буфер, только если его никто не менял после нас
-        DispatchQueue.main.asyncAfter(deadline: .now() + restoreDelay) {
-            guard pasteboard.changeCount == ourChangeCount else { return }
-            pasteboard.clearContents()
-            guard !backup.isEmpty else { return }
-            let items: [NSPasteboardItem] = backup.map { dict in
-                let item = NSPasteboardItem()
-                for (type, data) in dict { item.setData(data, forType: type) }
-                return item
-            }
-            pasteboard.writeObjects(items)
+        // A later paste inherits the original backup and owns its restoration.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(max(0, restoreDelay)))
+            self?.restoreClipboard(pasteboard, changeCount: ourChangeCount)
         }
 
         return true
@@ -227,7 +243,7 @@ public final class AXAdapter {
             if AXUIElementCopyAttributeValue(appEl, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
                let focused = focusedRef,
                CFGetTypeID(focused) == AXUIElementGetTypeID() {
-                let el = unsafeBitCast(focused, to: AXUIElement.self)
+                let el = unsafeDowncast(focused, to: AXUIElement.self)
                 AXUIElementSetMessagingTimeout(el, timeout)
                 return (el, app)
             }
@@ -239,7 +255,7 @@ public final class AXAdapter {
         if AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
            let focused = focusedRef,
            CFGetTypeID(focused) == AXUIElementGetTypeID() {
-            let el = unsafeBitCast(focused, to: AXUIElement.self)
+            let el = unsafeDowncast(focused, to: AXUIElement.self)
             AXUIElementSetMessagingTimeout(el, timeout)
             var pid: pid_t = 0
             AXUIElementGetPid(el, &pid)
@@ -291,7 +307,7 @@ public final class AXAdapter {
             return nil
         }
 
-        let axVal = unsafeBitCast(out, to: AXValue.self)
+        let axVal = unsafeDowncast(out, to: AXValue.self)
         guard AXValueGetType(axVal) == .cgRect else { return nil }
         var rect = CGRect.zero
         guard AXValueGetValue(axVal, .cgRect, &rect), rect.height > 0 else { return nil }

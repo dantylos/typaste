@@ -43,6 +43,7 @@ public final class PersonalMemoryStore {
         let flags = SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
         guard sqlite3_open_v2(databaseURL.path, &handle, flags, nil) == SQLITE_OK,
               let handle else {
+            if let handle { sqlite3_close_v2(handle) }
             NSLog("[PersonalMemoryStore] Failed to open SQLite database at %@", databaseURL.path)
             return
         }
@@ -62,8 +63,13 @@ public final class PersonalMemoryStore {
         );
         CREATE INDEX IF NOT EXISTS idx_user_phrases_norm ON user_phrases(normalized);
         CREATE INDEX IF NOT EXISTS idx_user_phrases_bundle_lang ON user_phrases(bundle_id, language, use_count DESC, last_used_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_user_phrases_lang_rank ON user_phrases(language, use_count DESC, last_used_at DESC);
         """
-        sqlite3_exec(handle, schema, nil, nil, nil)
+        guard sqlite3_exec(handle, schema, nil, nil, nil) == SQLITE_OK else {
+            NSLog("[PersonalMemoryStore] Schema setup failed: %s", sqlite3_errmsg(handle))
+            close()
+            return
+        }
     }
 
     // MARK: - Language & Text Normalization
@@ -140,6 +146,19 @@ public final class PersonalMemoryStore {
         return sentences.last
     }
 
+    /// The exclusive upper bound makes prefix lookup an indexed binary range.
+    nonisolated private static func prefixUpperBound(_ prefix: String) -> String {
+        var scalars = Array(prefix.unicodeScalars)
+        while let last = scalars.popLast() {
+            var value = last.value + 1
+            if value == 0xD800 { value = 0xE000 }
+            if let next = Unicode.Scalar(value) {
+                return String(String.UnicodeScalarView(scalars + [next]))
+            }
+        }
+        return prefix + "\u{10FFFF}"
+    }
+
     // MARK: - Recording Phrases
 
     /// Сохраняет или увеличивает счетчик использования фразы пользователя.
@@ -182,10 +201,12 @@ public final class PersonalMemoryStore {
         sqlite3_bind_text(stmt, 2, norm, -1, Self.sqliteTransient)
         sqlite3_bind_text(stmt, 3, bundleID, -1, Self.sqliteTransient)
         sqlite3_bind_text(stmt, 4, lang, -1, Self.sqliteTransient)
-        sqlite3_bind_int(stmt, 5, Int32(increment))
+        sqlite3_bind_int64(stmt, 5, Int64(increment))
         sqlite3_bind_double(stmt, 6, now)
 
-        _ = sqlite3_step(stmt)
+        if sqlite3_step(stmt) != SQLITE_DONE {
+            NSLog("[PersonalMemoryStore] Write failed: %s", sqlite3_errmsg(db))
+        }
     }
 
     // MARK: - Retrieving Completions & Style Examples
@@ -204,7 +225,7 @@ public final class PersonalMemoryStore {
 
         let sql = """
         SELECT text FROM user_phrases
-        WHERE normalized LIKE (?1 || '%')
+        WHERE normalized >= ?1 AND normalized < ?3
           AND length(normalized) > length(?1)
         ORDER BY (CASE WHEN bundle_id = ?2 THEN 1 ELSE 0 END) DESC,
                  use_count DESC,
@@ -218,8 +239,9 @@ public final class PersonalMemoryStore {
 
         sqlite3_bind_text(stmt, 1, normPrefix, -1, Self.sqliteTransient)
         sqlite3_bind_text(stmt, 2, bundleID, -1, Self.sqliteTransient)
+        sqlite3_bind_text(stmt, 3, Self.prefixUpperBound(normPrefix), -1, Self.sqliteTransient)
 
-        let trimmedSentencePrefix = sentencePrefix.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSentencePrefix = sentencePrefix.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
         guard !trimmedSentencePrefix.isEmpty else { return nil }
 
         while sqlite3_step(stmt) == SQLITE_ROW {
@@ -252,29 +274,41 @@ public final class PersonalMemoryStore {
     ) -> [String] {
         guard let db, limit > 0 else { return [] }
 
-        let lang = Self.detectLanguage(beforeCaret)
-        let sql = """
-        SELECT text FROM user_phrases
-        WHERE language = ?1
-        ORDER BY (CASE WHEN bundle_id = ?2 THEN 1 ELSE 0 END) DESC,
-                 use_count DESC,
-                 last_used_at DESC
-        LIMIT ?3;
-        """
+        let language = Self.detectLanguage(beforeCaret)
 
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
-        defer { sqlite3_finalize(stmt) }
-
-        sqlite3_bind_text(stmt, 1, lang, -1, Self.sqliteTransient)
-        sqlite3_bind_text(stmt, 2, bundleID, -1, Self.sqliteTransient)
-        sqlite3_bind_int(stmt, 3, Int32(limit))
-
-        var results: [String] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            if let cStr = sqlite3_column_text(stmt, 0) {
-                results.append(String(cString: cStr))
+        // Fetch app-local rows first using the composite index, then fill from
+        // the language/rank index without sorting the entire phrase collection.
+        func fetch(appOnly: Bool, count: Int) -> [String] {
+            let sql = appOnly
+                ? """
+                SELECT text FROM user_phrases
+                WHERE bundle_id = ?1 AND language = ?2
+                ORDER BY use_count DESC, last_used_at DESC LIMIT ?3;
+                """
+                : """
+                SELECT text FROM user_phrases
+                WHERE language = ?2 AND bundle_id != ?1
+                ORDER BY use_count DESC, last_used_at DESC LIMIT ?3;
+                """
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK,
+                  let statement else { return [] }
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_text(statement, 1, bundleID, -1, Self.sqliteTransient)
+            sqlite3_bind_text(statement, 2, language, -1, Self.sqliteTransient)
+            sqlite3_bind_int64(statement, 3, Int64(count))
+            var phrases: [String] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                if let text = sqlite3_column_text(statement, 0) {
+                    phrases.append(String(cString: text))
+                }
             }
+            return phrases
+        }
+
+        var results = fetch(appOnly: true, count: limit)
+        if results.count < limit {
+            results += fetch(appOnly: false, count: limit - results.count)
         }
         return results
     }

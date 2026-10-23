@@ -21,12 +21,14 @@ public final class AssistantCoordinator {
     private var debounceTimer: Timer?
     internal let debounceInterval: TimeInterval
     private var lastRecordedSentence: String?
+    private var requestID = UUID()
 
     /// Контекст, для которого была показана текущая подсказка.
     /// Без этой привязки Tab/Shift+Tab могли вставлять устаревший текст после клика мышью,
     /// смены окна или ввода в браузере (Orion).
     internal struct ActiveSuggestion {
         let element: AXUIElement
+        let id = UUID()
         var expectedBefore: String
         var isCompletingWord: Bool
     }
@@ -141,6 +143,7 @@ public final class AssistantCoordinator {
     }
 
     public func cancelAll() {
+        requestID = UUID()
         debounceTimer?.invalidate()
         debounceTimer = nil
         active = nil
@@ -160,6 +163,7 @@ public final class AssistantCoordinator {
               let ctx = active,
               let snap = snapshotProvider(true),
               !isExcluded(bundleID: snap.bundleID, appName: snap.appName),
+              snap.selectedRange.length == 0,
               CFEqual(snap.element, ctx.element),
               snap.beforeCaret == ctx.expectedBefore else {
             active = nil
@@ -214,7 +218,12 @@ public final class AssistantCoordinator {
             Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 60_000_000)
                 guard let self, self.isOverlayVisible(),
+                      self.active?.id == ctx.id,
+                      self.currentOverlaySuggestion() == displayRemainder,
                       let newSnap = self.snapshotProvider(false),
+                      newSnap.selectedRange.length == 0,
+                      CFEqual(newSnap.element, ctx.element),
+                      newSnap.beforeCaret == newBeforeCaret,
                       let caret = newSnap.caretRectCocoa else { return }
                 self.overlayUpdate(displayRemainder, caret)
             }
@@ -244,20 +253,18 @@ public final class AssistantCoordinator {
 
         active = nil
         overlayHide()
-        if inserter(textToInsert, ctx.element) {
-            let newBeforeCaret = snap.beforeCaret + textToInsert
-            let completedPhrase = PersonalMemoryStore.extractCurrentSentencePrefix(from: newBeforeCaret)
-            memoryStore?.recordPhrase(completedPhrase, bundleID: snap.bundleID, weight: 2)
-        }
+        guard inserter(textToInsert, ctx.element) else { return false }
+        let newBeforeCaret = snap.beforeCaret + textToInsert
+        let completedPhrase = PersonalMemoryStore.extractCurrentSentencePrefix(from: newBeforeCaret)
+        memoryStore?.recordPhrase(completedPhrase, bundleID: snap.bundleID, weight: 2)
         return true
     }
 
     /// Скрывает подсказку по `Esc` (возвращает `true`, если подсказка была видима).
     internal func dismissSuggestion() -> Bool {
-        guard isOverlayVisible() else { return false }
-        active = nil
-        overlayHide()
-        return true
+        let wasVisible = isOverlayVisible()
+        cancelAll()
+        return wasVisible
     }
 
     private func setupEventTap() {
@@ -282,6 +289,7 @@ public final class AssistantCoordinator {
     }
 
     internal func handleUserTyping(keyCode: Int64) {
+        requestID = UUID()
         // При любом нажатии клавиши сразу прячем старую подсказку и отменяем прошлую генерацию
         active = nil
         overlayHide()
@@ -303,7 +311,9 @@ public final class AssistantCoordinator {
 
     internal func triggerSuggestion() async {
         guard isEnabled else { return }
-        guard let snapshot = snapshotProvider(false) else { return }
+        guard let snapshot = snapshotProvider(false), snapshot.selectedRange.length == 0 else { return }
+        let generationID = UUID()
+        requestID = generationID
         guard !isExcluded(bundleID: snapshot.bundleID, appName: snapshot.appName) else { return }
 
         let before = snapshot.beforeCaret
@@ -325,7 +335,7 @@ public final class AssistantCoordinator {
 
         // 1. Быстрый путь (SQLite PersonalMemoryStore < 1 мс): проверяем точное совпадение частой фразы пользователя
         if let memoryMatch = memoryStore?.matchPrefixContinuation(for: before, bundleID: snapshot.bundleID) {
-            let completingWord = !before.isEmpty && !before.last!.isWhitespace
+            let completingWord = before.last?.isWhitespace == false && memoryMatch.first?.isWhitespace != true
             active = ActiveSuggestion(
                 element: snapshot.element,
                 expectedBefore: before,
@@ -337,12 +347,13 @@ public final class AssistantCoordinator {
 
         // 2. Генерация через Qwen3-1.7B-Instruct (с подстановкой релевантных фраз пользователя из SQLite)
         guard let suggestion = await generateHandler(before, 20),
-              !Task.isCancelled else {
+              !Task.isCancelled, isEnabled, requestID == generationID else {
             return
         }
 
         // Проверяем, что пользователь не изменил текст и не сменил фокус, пока модель думала
         guard let latest = snapshotProvider(false),
+              latest.selectedRange.length == 0,
               !isExcluded(bundleID: latest.bundleID, appName: latest.appName),
               CFEqual(latest.element, snapshot.element),
               latest.beforeCaret == before,
@@ -350,7 +361,7 @@ public final class AssistantCoordinator {
             return
         }
 
-        let completingWord = !before.isEmpty && !before.last!.isWhitespace
+        let completingWord = before.last?.isWhitespace == false && suggestion.first?.isWhitespace != true
         active = ActiveSuggestion(
             element: latest.element,
             expectedBefore: before,

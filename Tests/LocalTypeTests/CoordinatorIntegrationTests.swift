@@ -7,7 +7,7 @@ import XCTest
 final class CoordinatorIntegrationTests: XCTestCase {
 
     @MainActor
-    private final class Harness {
+    final class Harness {
         var snapshot: TextSnapshot?
         var insertedTexts: [String] = []
         var insertResult: Bool = true

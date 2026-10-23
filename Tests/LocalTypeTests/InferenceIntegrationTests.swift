@@ -91,14 +91,15 @@ final class InferenceIntegrationTests: XCTestCase {
 
     func testCancellationReturnsNil() async throws {
         let s = try await loadedService()
-        async let r = s.generateSuggestion(for: "Once upon a time there was a ", maxTokens: 20)
-        s.cancelCurrentGeneration()
-        let result = await r
-        // Отмена допустима в любой момент: либо nil, либо уже готовый результат — но не зависание/краш.
-        _ = result
+        let task = Task {
+            await s.generateSuggestion(for: "Once upon a time there was a ", maxTokens: 20)
+        }
+        task.cancel()
+        let result = await task.value
+        XCTAssertNil(result, "A cancelled caller must not receive a suggestion")
     }
 
-    func testMidWordNeverGluesWords() async throws {
+    func testMidWordSuggestionsHaveNoTrailingWhitespace() async throws {
         let s = try await loadedService()
         // Если подсказка начинается не с пробела на законченном слове, это дописывание — проверяем только инвариант формата.
         for p in ["Hello", "Thank", "Привет", "Спас"] {

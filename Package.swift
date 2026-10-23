@@ -16,13 +16,20 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-transformers", exact: "1.3.5"),
     ],
     targets: [
+        .target(
+            name: "ModelSupport",
+            dependencies: [
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ]
+        ),
         // Этап 0 (SPEC §13): проверка загрузки Qwen3-1.7B-Base 4-bit через MLX Swift.
         .executableTarget(
             name: "ModelSpike",
             dependencies: [
+                "ModelSupport",
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
-                .product(name: "Tokenizers", package: "swift-transformers"),
             ],
             path: "Sources/ModelSpike"
         ),
@@ -39,9 +46,9 @@ let package = Package(
         .executableTarget(
             name: "LocalType",
             dependencies: [
+                "ModelSupport",
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
-                .product(name: "Tokenizers", package: "swift-transformers"),
             ],
             path: "Sources/LocalType",
             linkerSettings: [

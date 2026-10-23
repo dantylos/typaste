@@ -6,14 +6,16 @@ import XCTest
 @MainActor
 final class OverlayAndEventTapIntegrationTests: XCTestCase {
 
-    override func tearDown() {
-        OverlayController.shared.hide()
-        let tap = EventTapManager.shared
-        tap.onTab = nil
-        tap.onShiftTab = nil
-        tap.onEscape = nil
-        tap.onTyping = nil
-        super.tearDown()
+    override func tearDown() async throws {
+        await MainActor.run {
+            OverlayController.shared.hide()
+            let tap = EventTapManager.shared
+            tap.onTab = nil
+            tap.onShiftTab = nil
+            tap.onEscape = nil
+            tap.onTyping = nil
+        }
+        try await super.tearDown()
     }
 
     func testOverlayShowUpdateAndHideLifecycle() {
@@ -54,10 +56,10 @@ final class OverlayAndEventTapIntegrationTests: XCTestCase {
             return
         }
 
-        // X should be clamped to at least screen.frame.minX + 10
-        XCTAssertGreaterThanOrEqual(frame.origin.x, screen.frame.minX + 10)
+        // X should be clamped to at least screen.visibleFrame.minX + 10
+        XCTAssertGreaterThanOrEqual(frame.origin.x, screen.visibleFrame.minX + 10)
         // Y should flip above the caret: bottomCaret.y + bottomCaret.height + 6
-        XCTAssertEqual(frame.origin.y, bottomCaret.origin.y + bottomCaret.height + 6, accuracy: 0.5)
+        XCTAssertEqual(frame.origin.y, max(screen.visibleFrame.minY + 10, bottomCaret.origin.y + bottomCaret.height + 6), accuracy: 0.5)
 
         overlay.hide()
     }

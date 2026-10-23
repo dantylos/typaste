@@ -62,12 +62,12 @@ enum AX {
     static func element(_ el: AXUIElement, _ attr: String) -> AXUIElement? {
         let (r, e) = copy(el, attr)
         guard e == .success, let r, CFGetTypeID(r) == AXUIElementGetTypeID() else { return nil }
-        return unsafeBitCast(r, to: AXUIElement.self)
+        return unsafeDowncast(r, to: AXUIElement.self)
     }
 
     static func axValue(_ ref: CFTypeRef?) -> AXValue? {
         guard let ref, CFGetTypeID(ref) == AXValueGetTypeID() else { return nil }
-        return unsafeBitCast(ref, to: AXValue.self)
+        return unsafeDowncast(ref, to: AXValue.self)
     }
 
     static func range(_ el: AXUIElement, _ attr: String) -> CFRange? {

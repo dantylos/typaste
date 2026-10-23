@@ -13,6 +13,7 @@ public final class OverlayController {
     public private(set) var isVisible: Bool = false
     public private(set) var currentSuggestion: String?
 
+    internal var isPanelVisible: Bool { panel?.isVisible ?? false }
     internal var panelFrame: NSRect? { panel?.frame }
     internal var displayedLabelText: String? { suggestionLabel?.stringValue }
 
@@ -35,7 +36,7 @@ public final class OverlayController {
         p.isReleasedWhenClosed = false
         p.alphaValue = 0.0
 
-        let effect = NSVisualEffectView(frame: p.contentView!.bounds)
+        let effect = NSVisualEffectView(frame: p.contentView?.bounds ?? .zero)
         effect.autoresizingMask = [.width, .height]
         effect.blendingMode = .behindWindow
         effect.material = .hudWindow
@@ -102,69 +103,37 @@ public final class OverlayController {
         self.currentSuggestion = suggestion
         label.stringValue = suggestion
 
-        // Расчет размера плашки в зависимости от длины текста
-        let font = label.font ?? NSFont.systemFont(ofSize: 13)
-        let textWidth = (suggestion as NSString).size(withAttributes: [.font: font]).width
-        let panelWidth = min(max(textWidth + 145, 230), 550)
-        let panelHeight: CGFloat = 36
-
-        // Позиционирование рядом с кареткой
-        var x = caretCocoa.origin.x + 4
-        var y = caretCocoa.origin.y - panelHeight - 6
-
-        // Проверяем границы экрана, чтобы плашка не вылезала за пределы
-        if let screen = NSScreen.screens.first(where: { $0.frame.contains(caretCocoa.origin) }) ?? NSScreen.main {
-            let maxX = screen.frame.maxX - panelWidth - 10
-            let minX = screen.frame.minX + 10
-            x = max(minX, min(x, maxX))
-
-            if y < screen.frame.minY + 10 {
-                // Если внизу нет места, показываем над кареткой
-                y = caretCocoa.origin.y + caretCocoa.height + 6
-            }
-        }
-
-        panel.setFrame(NSRect(x: x, y: y, width: panelWidth, height: panelHeight), display: true)
-
-        if !isVisible {
-            panel.orderFront(nil)
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.15
-                panel.animator().alphaValue = 1.0
-            }
-            isVisible = true
-        } else {
-            panel.alphaValue = 1.0
-        }
+        positionPanel(suggestion: suggestion, caret: caretCocoa)
+        panel.alphaValue = 1
+        panel.orderFront(nil)
+        isVisible = true
     }
 
     public func updateSuggestionText(_ newSuggestion: String, at newCaret: CGRect? = nil) {
-        guard isVisible, let panel, let label = suggestionLabel else { return }
-        self.currentSuggestion = newSuggestion
+        guard isVisible, let label = suggestionLabel else { return }
+        currentSuggestion = newSuggestion
         label.stringValue = newSuggestion
+        if let newCaret { lastCaretCocoa = newCaret }
+        guard let caret = lastCaretCocoa else { return }
+        positionPanel(suggestion: newSuggestion, caret: caret)
+    }
 
-        if let newCaret {
-            self.lastCaretCocoa = newCaret
-        }
-
-        let caret = self.lastCaretCocoa ?? CGRect(x: 100, y: 100, width: 2, height: 16)
-        let font = label.font ?? NSFont.systemFont(ofSize: 13)
-        let textWidth = (newSuggestion as NSString).size(withAttributes: [.font: font]).width
+    private func positionPanel(suggestion: String, caret: CGRect) {
+        guard let panel else { return }
+        let font = suggestionLabel?.font ?? NSFont.systemFont(ofSize: 13)
+        let textWidth = (suggestion as NSString).size(withAttributes: [.font: font]).width
         let panelWidth = min(max(textWidth + 145, 230), 550)
         let panelHeight: CGFloat = 36
-
         var x = caret.origin.x + 4
         var y = caret.origin.y - panelHeight - 6
-
         if let screen = NSScreen.screens.first(where: { $0.frame.contains(caret.origin) }) ?? NSScreen.main {
-            let maxX = screen.frame.maxX - panelWidth - 10
-            let minX = screen.frame.minX + 10
-            x = max(minX, min(x, maxX))
-            if y < screen.frame.minY + 10 {
-                y = caret.origin.y + caret.height + 6
+            let bounds = screen.visibleFrame
+            x = max(bounds.minX + 10, min(x, bounds.maxX - panelWidth - 10))
+            if y < bounds.minY + 10 {
+                y = caret.maxY + 6
             }
+            y = max(bounds.minY + 10, min(y, bounds.maxY - panelHeight - 10))
         }
-
         panel.setFrame(NSRect(x: x, y: y, width: panelWidth, height: panelHeight), display: true)
     }
 
@@ -173,11 +142,8 @@ public final class OverlayController {
         currentSuggestion = nil
         isVisible = false
 
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.1
-            panel.animator().alphaValue = 0.0
-        }, completionHandler: {
-            panel.orderOut(nil)
-        })
+        // Immediate dismissal avoids an old animation hiding a newer suggestion.
+        panel.alphaValue = 0
+        panel.orderOut(nil)
     }
 }
