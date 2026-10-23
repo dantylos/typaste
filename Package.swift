@@ -49,5 +49,11 @@ let package = Package(
                 .linkedFramework("AppKit"),
             ]
         ),
+        // Юнит-тесты логики подсказок + интеграционные проверки модели (Metal).
+        .testTarget(
+            name: "LocalTypeTests",
+            dependencies: ["LocalType"],
+            path: "Tests/LocalTypeTests"
+        ),
     ]
 )

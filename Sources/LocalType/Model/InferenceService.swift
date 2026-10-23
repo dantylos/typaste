@@ -63,12 +63,58 @@ public final class InferenceService {
     private let modelDirectory: URL
     public private(set) var isReady: Bool = false
 
-    public init(modelDirectory: URL = URL(fileURLWithPath: "Models/Qwen3-1.7B-Base-mlx-4Bit")) {
+    nonisolated public static let modelFolderName = "Qwen3-1.7B-Base-mlx-4Bit"
+    nonisolated private static let maxPromptCharacters = 2048
+    nonisolated private static let maxSuggestionWords = 4
+
+    public init(modelDirectory: URL = InferenceService.resolveModelDirectory()) {
         self.modelDirectory = modelDirectory
+    }
+
+    /// Порядок поиска: $LOCALTYPE_MODEL_DIR → Resources бандла → подъём вверх от исполняемого файла → от cwd.
+    nonisolated public static func resolveModelDirectory(sourceFile: String = #filePath) -> URL {
+        let fm = FileManager.default
+        func isModel(_ url: URL) -> Bool {
+            fm.fileExists(atPath: url.appendingPathComponent("config.json").path)
+        }
+
+        if let env = ProcessInfo.processInfo.environment["LOCALTYPE_MODEL_DIR"], !env.isEmpty {
+            let url = URL(fileURLWithPath: env)
+            if isModel(url) { return url }
+        }
+
+        if let res = Bundle.main.resourceURL {
+            let url = res.appendingPathComponent("Models/\(modelFolderName)")
+            if isModel(url) { return url }
+        }
+
+        var starts: [URL] = []
+        if let exe = Bundle.main.executableURL { starts.append(exe.deletingLastPathComponent()) }
+        starts.append(URL(fileURLWithPath: fm.currentDirectoryPath))
+        // Dev/test-хосты (xctest и т.п.): путь исходника, зашитый при компиляции
+        starts.append(URL(fileURLWithPath: sourceFile).deletingLastPathComponent())
+        for start in starts {
+            var dir = start
+            for _ in 0..<10 {
+                let url = dir.appendingPathComponent("Models/\(modelFolderName)")
+                if isModel(url) { return url }
+                let parent = dir.deletingLastPathComponent()
+                if parent == dir { break }
+                dir = parent
+            }
+        }
+
+        // Не найдено: вернём ожидаемый путь — loadModel() выдаст понятную ошибку.
+        return URL(fileURLWithPath: fm.currentDirectoryPath).appendingPathComponent("Models/\(modelFolderName)")
     }
 
     public func loadModel() async throws {
         guard container == nil else { return }
+        guard FileManager.default.fileExists(atPath: modelDirectory.appendingPathComponent("config.json").path) else {
+            throw NSError(domain: "LocalType", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Модель не найдена: \(modelDirectory.path). Задайте LOCALTYPE_MODEL_DIR."
+            ])
+        }
         let start = Date()
         NSLog("[InferenceService] Loading model from: %@", modelDirectory.path)
         let loaded = try await loadModelContainer(
@@ -97,10 +143,8 @@ public final class InferenceService {
                 return try await container.perform { context -> String? in
                     guard !Task.isCancelled else { return nil }
 
-                    // Ограничиваем длину промпта последними ~2048 символами
-                    let trimmedPrompt = prompt.count > 2048
-                        ? String(prompt.suffix(2048))
-                        : prompt
+                    // Ограничиваем длину промпта; режем по границе слова, если обрезано начало
+                    let trimmedPrompt = SuggestionText.trimPrompt(prompt, limit: Self.maxPromptCharacters)
 
                     guard !trimmedPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                         return nil
@@ -111,7 +155,7 @@ public final class InferenceService {
 
                     let input = LMInput(tokens: MLXArray(promptTokens))
                     var params = GenerateParameters()
-                    params.maxTokens = 16
+                    params.maxTokens = maxTokens
                     params.temperature = 0.4
                     params.topP = 0.9
                     params.repetitionPenalty = 1.05
@@ -135,25 +179,25 @@ public final class InferenceService {
                             // Ограничиваемся одной строкой
                             if generatedText.contains("\n") {
                                 let line = generatedText.components(separatedBy: "\n").first ?? ""
-                                return Self.formatSuggestion(line, prompt: trimmedPrompt, maxWords: 4)
+                                return SuggestionText.format(line, prompt: trimmedPrompt, maxWords: Self.maxSuggestionWords)
                             }
 
                             // Проверяем количество сгенерированных слов
                             let words = generatedText.split(whereSeparator: { $0.isWhitespace })
                             if words.count >= 4 {
-                                return Self.formatSuggestion(generatedText, prompt: trimmedPrompt, maxWords: 4)
+                                return SuggestionText.format(generatedText, prompt: trimmedPrompt, maxWords: Self.maxSuggestionWords)
                             }
 
                             // Если предложение завершено пунктуацией
                             if words.count >= 1, tokenText.contains(".") || tokenText.contains("?") || tokenText.contains("!") {
-                                return Self.formatSuggestion(generatedText, prompt: trimmedPrompt, maxWords: 4)
+                                return SuggestionText.format(generatedText, prompt: trimmedPrompt, maxWords: Self.maxSuggestionWords)
                             }
                         default:
                             break
                         }
                     }
 
-                    return Self.formatSuggestion(generatedText, prompt: trimmedPrompt, maxWords: 4)
+                    return SuggestionText.format(generatedText, prompt: trimmedPrompt, maxWords: Self.maxSuggestionWords)
                 }
             } catch {
                 if !Task.isCancelled {
@@ -170,48 +214,5 @@ public final class InferenceService {
     public func cancelCurrentGeneration() {
         currentTask?.cancel()
         currentTask = nil
-    }
-
-    nonisolated private static func formatSuggestion(_ text: String, prompt: String, maxWords: Int) -> String? {
-        var cleaned = text.trimmingCharacters(in: .newlines)
-
-        let promptHasTrailingSpace = prompt.hasSuffix(" ") || prompt.hasSuffix("\t")
-
-        if promptHasTrailingSpace {
-            // Пользователь уже нажал пробел после предыдущего слова:
-            // Убираем возможный дублирующий начальный пробел из генерации модели
-            while cleaned.hasPrefix(" ") {
-                cleaned.removeFirst()
-            }
-        } else {
-            // Пользователь печатает слово (пробела в конце промпта нет).
-            // Модель должна продолжать текущее слово:
-            // Убираем пробелы, чтобы окончание приклеивалось ровно к напечатанной части слова
-            while cleaned.hasPrefix(" ") {
-                cleaned.removeFirst()
-            }
-        }
-
-        let words = cleaned.split(whereSeparator: { $0.isWhitespace })
-        guard !words.isEmpty else { return nil }
-
-        // Ограничиваем от 1 до maxWords слов
-        let limitedWords = words.prefix(maxWords)
-        let joined = limitedWords.joined(separator: " ")
-
-        // Фильтруем численные артефакты (например, "10", "10,", "2022 год")
-        if let firstWord = limitedWords.first {
-            let stripped = firstWord.trimmingCharacters(in: .punctuationCharacters)
-            if !stripped.isEmpty && stripped.allSatisfy({ $0.isNumber }) {
-                return nil
-            }
-        }
-
-        let result = joined.trimmingCharacters(in: .whitespacesAndNewlines)
-        if Double(result) != nil {
-            return nil
-        }
-
-        return result.isEmpty ? nil : result
     }
 }

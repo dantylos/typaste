@@ -18,11 +18,14 @@ public struct TextSnapshot {
 public final class AXAdapter {
     public static let shared = AXAdapter()
     private let timeout: Float = 0.3
+    /// Короткий таймаут для вызовов из колбэка CGEventTap (не блокируем ввод всей системы).
+    private let fastTimeout: Float = 0.08
 
     private init() {}
 
-    public func currentSnapshot() -> TextSnapshot? {
-        guard let (el, app) = focusedElement() else { return nil }
+    /// - Parameter fast: короткий AX-таймаут и без расчёта экранного прямоугольника каретки.
+    public func currentSnapshot(fast: Bool = false) -> TextSnapshot? {
+        guard let (el, app) = focusedElement(timeout: fast ? fastTimeout : timeout) else { return nil }
 
         // Проверяем, не является ли поле защищенным (пароль)
         var subroleRef: CFTypeRef?
@@ -58,7 +61,7 @@ public final class AXAdapter {
             ? nsString.substring(from: loc + range.length)
             : ""
 
-        let axCaret = calculateCaretRect(el: el, location: loc, fullText: fullText)
+        let axCaret = fast ? nil : calculateCaretRect(el: el, location: loc, fullText: fullText)
         let cocoaCaret = axCaret.map { convertAXToCocoa(axRect: $0) }
 
         return TextSnapshot(
@@ -108,13 +111,20 @@ public final class AXAdapter {
 
     private func insertViaTransientClipboard(_ text: String) -> Bool {
         let pasteboard = NSPasteboard.general
-        let previousChangeCount = pasteboard.changeCount
-        let previousString = pasteboard.string(forType: .string)
+        // Полная копия буфера (все элементы и типы), а не только строки.
+        let backup: [[NSPasteboard.PasteboardType: Data]] = (pasteboard.pasteboardItems ?? []).map { item in
+            var dict: [NSPasteboard.PasteboardType: Data] = [:]
+            for type in item.types {
+                if let data = item.data(forType: type) { dict[type] = data }
+            }
+            return dict
+        }
 
         pasteboard.clearContents()
         guard pasteboard.setString(text, forType: .string) else {
             return false
         }
+        let ourChangeCount = pasteboard.changeCount
 
         // Эмулируем сочетание клавиш Cmd+V
         let src = CGEventSource(stateID: .combinedSessionState)
@@ -137,12 +147,17 @@ public final class AXAdapter {
         vUp.post(tap: .cghidEventTap)
         cmdUp.post(tap: .cghidEventTap)
 
-        // Восстанавливаем оригинальный буфер обмена пользователя
+        // Восстанавливаем оригинальный буфер, только если его никто не менял после нас
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            if pasteboard.changeCount == previousChangeCount + 1, let previous = previousString {
-                pasteboard.clearContents()
-                pasteboard.setString(previous, forType: .string)
+            guard pasteboard.changeCount == ourChangeCount else { return }
+            pasteboard.clearContents()
+            guard !backup.isEmpty else { return }
+            let items: [NSPasteboardItem] = backup.map { dict in
+                let item = NSPasteboardItem()
+                for (type, data) in dict { item.setData(data, forType: type) }
+                return item
             }
+            pasteboard.writeObjects(items)
         }
 
         return true
@@ -150,7 +165,7 @@ public final class AXAdapter {
 
     // MARK: - Private Helpers
 
-    private func focusedElement() -> (AXUIElement, NSRunningApplication?)? {
+    private func focusedElement(timeout: Float) -> (AXUIElement, NSRunningApplication?)? {
         if let app = NSWorkspace.shared.frontmostApplication {
             let appEl = AXUIElementCreateApplication(app.processIdentifier)
             AXUIElementSetMessagingTimeout(appEl, timeout)

@@ -8,3 +8,4 @@ Models/**/*.bin
 Models/**/*.mlx
 .venv/
 ProbeResults/
+*.profraw

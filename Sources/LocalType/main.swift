@@ -5,10 +5,15 @@ import Foundation
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var toggleItem: NSMenuItem?
+    private var infoItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
         setupStatusBar()
+
+        AssistantCoordinator.shared.onStatusChange = { [weak self] status in
+            self?.infoItem?.title = "Qwen3-1.7B-Base 4-bit: \(status)"
+        }
 
         Task {
             await AssistantCoordinator.shared.start()
@@ -31,6 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         infoItem.isEnabled = false
         menu.addItem(infoItem)
+        self.infoItem = infoItem
 
         menu.addItem(NSMenuItem.separator())
 
